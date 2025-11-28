@@ -20,6 +20,12 @@ pub use errors::{BeaconError, HostError};
 mod sketch;
 pub use sketch::EvmSketch;
 
+// Re-export tracing types for convenience
+pub use sp1_cc_client_executor::{
+    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
+    TracingInspectorConfig,
+};
+
 mod sketch_builder;
 pub use sketch_builder::EvmSketchBuilder;
 

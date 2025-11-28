@@ -39,6 +39,7 @@ reth-optimism-primitives = { workspace = true, optional = true, features = ["ser
 # revm
 revm.workspace = true
 revm-primitives.workspace = true
+revm-inspectors.workspace = true
 op-revm = { workspace = true, optional = true }
 
 # alloy

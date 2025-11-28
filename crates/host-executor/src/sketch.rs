@@ -14,7 +14,7 @@ use rsp_primitives::{account_proof::eip1186_proof_to_account_proof, genesis::Gen
 use rsp_rpc_db::{BasicRpcDb, RpcDb};
 use sp1_cc_client_executor::{
     io::{EvmSketchInput, Primitives},
-    Anchor, ContractInput,
+    Anchor, CallTraceArena, ContractInput,
 };
 
 use crate::{EvmSketchBuilder, HostError};
@@ -71,6 +71,33 @@ where
         };
 
         Ok(C::abi_decode_returns(&output_bytes)?)
+    }
+
+    /// Executes a smart contract call with opcode tracing.
+    ///
+    /// Returns both the call result and the execution trace containing all opcodes executed.
+    /// The accessed accounts and storages are recorded, and included in a [`EvmSketchInput`]
+    /// when [`Self::finalize`] is called.
+    pub async fn call_with_trace<C: SolCall>(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        calldata: C,
+    ) -> eyre::Result<(C::Return, CallTraceArena)> {
+        let cache_db = CacheDB::new(&self.rpc_db);
+        let chain_spec = PT::build_spec(&self.genesis)?;
+        let input = ContractInput::new_call(contract_address, caller_address, calldata);
+        let (output, trace) =
+            PT::transact_with_trace(&input, cache_db, self.anchor.header(), U256::ZERO, chain_spec)
+                .map_err(|err| eyre!(err))?;
+
+        let output_bytes = match output.result {
+            ExecutionResult::Success { output, .. } => output.data().clone(),
+            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
+            ExecutionResult::Halt { reason, .. } => bail!("Execution halted: {reason:?}"),
+        };
+
+        Ok((C::abi_decode_returns(&output_bytes)?, trace))
     }
 
     /// Executes a smart contract call, using the provided [`ContractInput`].

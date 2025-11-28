@@ -48,6 +48,12 @@ pub use anchor::{
 
 pub mod io;
 
+pub mod inspector;
+pub use inspector::{
+    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
+    TracingInspectorConfig,
+};
+
 mod errors;
 pub use errors::ClientError;
 
