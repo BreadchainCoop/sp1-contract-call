@@ -24,7 +24,7 @@
 //! }
 //! ```
 
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::{Address, Bytes, U256};
 use alloy_rpc_types::BlockNumberOrTag;
 use eyre::Result;
 use reth_primitives::EthPrimitives;
@@ -66,6 +66,26 @@ pub struct OpcodeExecution {
     pub gas_remaining: u64,
     /// Gas cost of this step.
     pub gas_cost: u64,
+    /// Stack snapshot at this step (top of stack is index 0).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack: Vec<U256>,
+    /// Memory snapshot at this step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory: Vec<u8>,
+    /// Storage change if this is an SSTORE (slot, old_value, new_value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_change: Option<StorageChange>,
+}
+
+/// A storage slot change from SSTORE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageChange {
+    /// The storage slot key.
+    pub slot: U256,
+    /// The value before the change.
+    pub old_value: U256,
+    /// The value after the change.
+    pub new_value: U256,
 }
 
 /// The result of tracing a contract call.
@@ -162,12 +182,37 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
     for node in nodes {
         for step in &node.trace.steps {
             let name = step.op.as_str().to_string();
+
+            // Extract stack (reversed so index 0 is top of stack)
+            let stack = step
+                .stack
+                .as_ref()
+                .map(|s| s.iter().rev().copied().collect())
+                .unwrap_or_default();
+
+            // Extract memory
+            let memory = step
+                .memory
+                .as_ref()
+                .map(|m| m.as_bytes().to_vec())
+                .unwrap_or_default();
+
+            // Extract storage change for SSTORE
+            let storage_change = step.storage_change.as_ref().map(|sc| StorageChange {
+                slot: sc.key,
+                old_value: sc.had_value.unwrap_or_default(),
+                new_value: sc.value,
+            });
+
             opcodes.push(OpcodeExecution {
                 pc: step.pc,
                 opcode: step.op.get(),
                 name,
                 gas_remaining: step.gas_remaining,
                 gas_cost: step.gas_cost,
+                stack,
+                memory,
+                storage_change,
             });
             total_gas_used += step.gas_cost;
         }
@@ -214,6 +259,9 @@ mod tests {
             name: "PUSH1".to_string(),
             gas_remaining: 1000000,
             gas_cost: 3,
+            stack: vec![U256::from(42)],
+            memory: vec![],
+            storage_change: None,
         };
 
         let json = serde_json::to_string(&op).unwrap();
@@ -221,5 +269,32 @@ mod tests {
 
         assert_eq!(parsed.opcode, 0x60);
         assert_eq!(parsed.name, "PUSH1");
+        assert_eq!(parsed.stack.len(), 1);
+    }
+
+    #[test]
+    fn test_storage_change_serialization() {
+        let op = OpcodeExecution {
+            pc: 100,
+            opcode: 0x55, // SSTORE
+            name: "SSTORE".to_string(),
+            gas_remaining: 500000,
+            gas_cost: 20000,
+            stack: vec![U256::from(1), U256::from(42)], // slot, value
+            memory: vec![],
+            storage_change: Some(StorageChange {
+                slot: U256::from(1),
+                old_value: U256::ZERO,
+                new_value: U256::from(42),
+            }),
+        };
+
+        let json = serde_json::to_string(&op).unwrap();
+        let parsed: OpcodeExecution = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed.storage_change.is_some());
+        let sc = parsed.storage_change.unwrap();
+        assert_eq!(sc.slot, U256::from(1));
+        assert_eq!(sc.new_value, U256::from(42));
     }
 }
