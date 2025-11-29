@@ -164,6 +164,7 @@ classDiagram
     class GasKillerSlasher {
         +ISP1Verifier sp1Verifier
         +IHeliosLightClient helios
+        +IGasKillerServiceManager serviceManager
         +bytes32 programVKey
         +uint256 challengeWindow
         +slash(commitment, sp1Proof, publicValues)
@@ -178,6 +179,7 @@ classDiagram
         +bytes contractCalldata
         +bytes storageUpdates
         +bytes blsSignature
+        +address[] signers
     }
 
     class ContractPublicValuesWithTrace {
@@ -201,10 +203,21 @@ classDiagram
         +getBlockHash(blockNumber) bytes32
     }
 
+    class GasKillerServiceManager {
+        +IAllocationManager allocationManager
+        +requestSlashing(operator, description)
+    }
+
+    class IAllocationManager {
+        +slashOperator(avs, SlashingParams)
+    }
+
     GasKillerSlasher --> ISP1Verifier : verifies proofs
     GasKillerSlasher --> IHeliosLightClient : verifies blocks
     GasKillerSlasher --> SignedCommitment : validates
     GasKillerSlasher --> ContractPublicValuesWithTrace : extracts
+    GasKillerSlasher --> GasKillerServiceManager : requests slashing
+    GasKillerServiceManager --> IAllocationManager : executes slashing
 ```
 
 ### 5.2 Sequence Diagram: Slashing Flow
@@ -212,28 +225,34 @@ classDiagram
 ```mermaid
 sequenceDiagram
     participant Challenger
-    participant SlashingContract
+    participant GasKillerSlasher
     participant SP1Verifier
     participant Helios
-    participant EigenLayer
+    participant ServiceManager
+    participant AllocationManager
 
     Note over Challenger: Detects fraudulent commitment
 
     Challenger->>Challenger: Generate SP1 proof locally
-    Challenger->>SlashingContract: slash(commitment, proof, publicValues)
+    Challenger->>GasKillerSlasher: slash(commitment, proof, publicValues)
 
-    SlashingContract->>SlashingContract: Verify BLS signature
-    SlashingContract->>SP1Verifier: verifyProof(vkey, publicValues, proof)
-    SP1Verifier-->>SlashingContract: Valid ✓
+    GasKillerSlasher->>GasKillerSlasher: Verify BLS signature
+    GasKillerSlasher->>SP1Verifier: verifyProof(vkey, publicValues, proof)
+    SP1Verifier-->>GasKillerSlasher: Valid ✓
 
-    SlashingContract->>Helios: isBlockHashValid(anchorHash)
-    Helios-->>SlashingContract: Valid ✓
+    GasKillerSlasher->>Helios: isBlockHashValid(anchorHash)
+    Helios-->>GasKillerSlasher: Valid ✓
 
-    SlashingContract->>SlashingContract: Compare storageUpdates
-    Note over SlashingContract: signed ≠ proven → FRAUD
+    GasKillerSlasher->>GasKillerSlasher: Compare storageUpdates
+    Note over GasKillerSlasher: signed ≠ proven → FRAUD
 
-    SlashingContract->>EigenLayer: initiateSlashing(operators)
-    SlashingContract-->>Challenger: SlashingExecuted event
+    loop For each signer
+        GasKillerSlasher->>ServiceManager: requestSlashing(operator, reason)
+        ServiceManager->>AllocationManager: slashOperator(avs, SlashingParams)
+        AllocationManager-->>ServiceManager: Stake slashed ✓
+    end
+
+    GasKillerSlasher-->>Challenger: SlashingExecuted event
 ```
 
 ### 5.3 State Diagram: Commitment Lifecycle
@@ -423,300 +442,20 @@ function detectFraud(
 
 ## 7. EigenLayer Integration
 
-### 7.1 Overview
-
-EigenLayer slashing went live on mainnet on April 17, 2025. Gas Killer must integrate with EigenLayer's slashing infrastructure to penalize operators who sign incorrect storage updates. The key integration points are:
-
-- **AllocationManager**: Core contract that executes slashing
-- **Operator Sets**: Grouping mechanism for operators within an AVS
-- **Unique Stake**: Allocatable stake that can only be slashed once per commitment
-- **ServiceManagerBase**: AVS contract that receives slashing callbacks
-
-### 7.2 Core Contracts
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        EigenLayer Core                               │
-├─────────────────────────────────────────────────────────────────────┤
-│  AllocationManager                                                   │
-│  ├── slashOperator(avs, SlashingParams)                             │
-│  ├── modifyAllocations(operator, allocations)                       │
-│  └── getAllocatedMagnitude(operator, strategy, operatorSet)         │
-├─────────────────────────────────────────────────────────────────────┤
-│  DelegationManager                                                   │
-│  ├── getOperatorShares(operator, strategies)                        │
-│  └── getWithdrawableShares(staker, strategies)                      │
-├─────────────────────────────────────────────────────────────────────┤
-│  StrategyManager                                                     │
-│  └── strategies[] (LSTs, native ETH, etc.)                          │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 7.3 Slashing Parameters
-
-```solidity
-/// @notice Struct for slashing an operator
-struct SlashingParams {
-    address operator;           // Operator to slash
-    uint32 operatorSetId;       // Operator set within the AVS
-    address[] strategies;       // Strategies to slash (e.g., stETH, rETH)
-    uint256[] wadsToSlash;      // Slash amount per strategy (in WADs, 1e18 = 100%)
-    string description;         // Human-readable reason for slashing
-}
-
-/// @notice Operator set identifier
-struct OperatorSet {
-    address avs;                // AVS address (Gas Killer ServiceManager)
-    uint32 operatorSetId;       // Numeric ID for the operator set
-}
-```
-
-### 7.4 Gas Killer AVS Configuration
-
-The Gas Killer AVS must be configured with:
-
-1. **Operator Set(s)**: At least one operator set for aggregate network operators
-2. **Slashable Strategies**: Which staking strategies can be slashed
-3. **Allocation Requirements**: Minimum stake allocation per operator
-
-```solidity
-// Example operator set configuration
-struct GasKillerOperatorSet {
-    uint32 id;                          // e.g., 1 for mainnet aggregate network
-    uint256 minimumAllocationWad;       // e.g., 0.1e18 (10% of operator's stake)
-    address[] requiredStrategies;       // e.g., [stETH, rETH, native ETH]
-}
-```
-
-### 7.5 Slashing Flow with EigenLayer
-
-```mermaid
-sequenceDiagram
-    participant Challenger
-    participant GasKillerSlasher
-    participant SP1Verifier
-    participant GasKillerServiceManager
-    participant AllocationManager
-    participant Operator
-
-    Note over Challenger: Detects fraudulent commitment
-
-    Challenger->>GasKillerSlasher: slash(commitment, proof, publicValues)
-    GasKillerSlasher->>SP1Verifier: verifyProof(vkey, publicValues, proof)
-    SP1Verifier-->>GasKillerSlasher: Valid ✓
-
-    GasKillerSlasher->>GasKillerSlasher: Compare storage updates
-    Note over GasKillerSlasher: signed ≠ proven → FRAUD
-
-    GasKillerSlasher->>GasKillerServiceManager: requestSlashing(operator, reason)
-
-    GasKillerServiceManager->>AllocationManager: slashOperator(avs, SlashingParams)
-    Note over AllocationManager: Validates AVS is authorized<br/>Validates operator in set<br/>Calculates slash amount
-
-    AllocationManager->>AllocationManager: Reduce operator magnitude
-    AllocationManager->>AllocationManager: Burn slashed tokens (or lock in EigenPod)
-
-    AllocationManager-->>GasKillerServiceManager: SlashingExecuted event
-    GasKillerServiceManager-->>Challenger: OperatorSlashed event
-```
-
-### 7.6 ServiceManagerBase Implementation
-
-The Gas Killer ServiceManager must implement EigenLayer's AVS interface:
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-
-import {ServiceManagerBase} from "@eigenlayer-middleware/ServiceManagerBase.sol";
-import {IAllocationManager} from "@eigenlayer/interfaces/IAllocationManager.sol";
-
-contract GasKillerServiceManager is ServiceManagerBase {
-    /// @notice The slashing contract authorized to request slashing
-    address public slashingContract;
-
-    /// @notice Operator set ID for aggregate network operators
-    uint32 public constant AGGREGATE_OPERATOR_SET_ID = 1;
-
-    /// @notice Default slash percentage (10% = 0.1e18)
-    uint256 public constant DEFAULT_SLASH_WAD = 0.1e18;
-
-    /// @notice Strategies that can be slashed
-    address[] public slashableStrategies;
-
-    /// @notice Request slashing of an operator
-    /// @param operator The operator to slash
-    /// @param description Reason for slashing
-    function requestSlashing(
-        address operator,
-        string calldata description
-    ) external {
-        require(msg.sender == slashingContract, "Only slashing contract");
-
-        // Build slashing parameters
-        uint256[] memory wadsToSlash = new uint256[](slashableStrategies.length);
-        for (uint256 i = 0; i < slashableStrategies.length; i++) {
-            wadsToSlash[i] = DEFAULT_SLASH_WAD;
-        }
-
-        IAllocationManager.SlashingParams memory params = IAllocationManager.SlashingParams({
-            operator: operator,
-            operatorSetId: AGGREGATE_OPERATOR_SET_ID,
-            strategies: slashableStrategies,
-            wadsToSlash: wadsToSlash,
-            description: description
-        });
-
-        // Execute slashing via AllocationManager
-        allocationManager.slashOperator(address(this), params);
-    }
-
-    /// @notice Callback when slashing is executed (optional)
-    function onSlashingExecuted(
-        address operator,
-        uint32 operatorSetId,
-        uint256[] memory slashedAmounts
-    ) external {
-        // Called by AllocationManager after slashing
-        // Can be used for logging, challenger rewards, etc.
-    }
-}
-```
-
-### 7.7 Unique Stake and Magnitude System
-
-EigenLayer uses a **magnitude** system for stake allocation:
-
-- **Total Magnitude**: 1e18 (100%) of an operator's stake per strategy
-- **Allocated Magnitude**: Portion assigned to specific operator sets
-- **Proportional Slashing**: `slashedAmount = totalShares * allocatedMagnitude * wadToSlash / 1e36`
-
-```solidity
-/// @notice How stake allocation works
-///
-/// Operator has 100 stETH delegated to them.
-/// They allocate 0.2e18 (20%) magnitude to Gas Killer AVS.
-/// If slashed at 0.1e18 (10%), they lose:
-///   100 * 0.2 * 0.1 = 2 stETH
-///
-/// The magnitude system ensures:
-/// 1. Unique stake - same tokens can't be slashed twice for same offense
-/// 2. Proportional penalties - larger allocations = more at risk
-/// 3. AVS isolation - slashing in one AVS doesn't affect others
-```
-
-### 7.8 Timing and Delays
-
-EigenLayer enforces timing constraints for security:
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| **Deallocation Delay** | 14 days | Operator can't deallocate stake to avoid pending slashing |
-| **Withdrawal Delay** | 14 days | Stakers can't withdraw to avoid pending slashing |
-| **Allocation Effect** | Immediate | New allocations are immediately slashable |
-
-**Implication for Gas Killer:**
-- Challenge window should be ≤14 days to ensure operators can still be slashed
-- Recommended: 7-day challenge window provides buffer for edge cases
-
-### 7.9 Slashed Funds Destination
-
-Slashed funds are handled as follows:
-
-| Token Type | Destination |
-|------------|-------------|
-| **ERC20 Strategies** (LSTs) | Burned to `0x000000000000000000000000000000000000e16E4` |
-| **Native ETH** (EigenPod) | Locked in pod (cannot be withdrawn) |
-
-**Note**: Currently, slashed funds are burned/locked, not redistributed. Future EigenLayer upgrades may enable challenger rewards.
-
-### 7.10 Migration Requirements
-
-To enable slashing, the Gas Killer AVS must:
-
-1. **Migrate from AVSDirectory to Operator Sets**
-   - Use `AllocationManager.createOperatorSets()` to define operator sets
-   - Register operators via `registerOperatorToOperatorSets()`
-
-2. **Define Slashable Strategies**
-   - Specify which ERC20 strategies (stETH, rETH, etc.) can be slashed
-   - Configure magnitude requirements per strategy
-
-3. **Implement Slashing Authorization**
-   - Only authorized contracts (GasKillerSlasher) can call `requestSlashing()`
-   - ServiceManager must be registered as an AVS with slashing capability
-
-### 7.11 Updated Slashing Contract Interface
-
-```solidity
-interface IGasKillerSlasher {
-    // ... existing interface ...
-
-    /// @notice EigenLayer integration
-    function serviceManager() external view returns (address);
-
-    /// @notice Slash all operators who signed a fraudulent commitment
-    /// @dev Iterates through signers and calls serviceManager.requestSlashing() for each
-    function slash(
-        SignedCommitment calldata commitment,
-        bytes calldata sp1Proof,
-        bytes calldata sp1PublicValues
-    ) external;
-}
-```
-
-### 7.12 Complete Slashing Implementation
-
-```solidity
-function slash(
-    SignedCommitment calldata commitment,
-    bytes calldata sp1Proof,
-    bytes calldata sp1PublicValues
-) external {
-    bytes32 commitmentHash = keccak256(abi.encode(commitment));
-
-    // Check not already slashed
-    require(!slashed[commitmentHash], "Already slashed");
-
-    // Check within challenge window
-    require(
-        block.timestamp <= commitment.timestamp + challengeWindow,
-        "Challenge window expired"
-    );
-
-    // Verify SP1 proof
-    sp1Verifier.verifyProof(programVKey, sp1PublicValues, sp1Proof);
-
-    // Verify block hash via Helios or EIP-4788
-    require(
-        helios.isBlockHashValid(commitment.anchorHash) ||
-        isRecentBlockHash(commitment.anchorHash),
-        "Block hash not verified"
-    );
-
-    // Detect fraud
-    (bool isFraud, string memory reason) = detectFraud(commitment, sp1PublicValues);
-    require(isFraud, reason);
-
-    // Mark as slashed
-    slashed[commitmentHash] = true;
-
-    // Slash each signer via EigenLayer
-    for (uint256 i = 0; i < commitment.signers.length; i++) {
-        IGasKillerServiceManager(serviceManager).requestSlashing(
-            commitment.signers[i],
-            string(abi.encodePacked("Fraudulent storage updates: ", reason))
-        );
-    }
-
-    emit SlashingExecuted(
-        commitmentHash,
-        msg.sender,
-        commitment.signers,
-        DEFAULT_SLASH_WAD
-    );
-}
-```
+To execute slashing, Gas Killer integrates with EigenLayer's AllocationManager (slashing went live April 2025). Key requirements:
+
+| Component | Purpose |
+|-----------|---------|
+| **AllocationManager** | Executes `slashOperator(avs, SlashingParams)` to slash operator stake |
+| **Operator Sets** | Operators must be registered to Gas Killer's operator set (ID 1) |
+| **ServiceManager** | Gas Killer's AVS contract calls AllocationManager on fraud detection |
+| **Unique Stake** | Magnitude-based allocation ensures stake can only be slashed once per offense |
+
+**Timing Constraints:**
+- 14-day deallocation/withdrawal delay prevents operators escaping slashing
+- Challenge window must be ≤14 days (recommended: 7 days)
+
+**Slashed Funds:** Currently burned (ERC20) or locked (native ETH). Challenger rewards require separate mechanism.
 
 ---
 
@@ -731,9 +470,6 @@ function slash(
 | **Helios Sync Delay** | Helios not synced to anchor block | Allow EIP-4788 fallback for recent blocks |
 | **Multiple Challengers** | Race condition on slashing | First valid slash wins, others refunded |
 | **Partial Quorum Slash** | Only some signers were malicious | Slash all signers equally (simplest model) |
-| **Operator Deallocation** | Operator attempts to deallocate before slashing | 14-day delay prevents escape |
-| **Staker Withdrawal** | Staker withdraws before operator slashed | 14-day withdrawal delay prevents escape |
-| **Low Allocation** | Operator has minimal stake allocated | Minimum allocation requirements enforced by AVS |
 
 ### Design Concessions
 
@@ -745,25 +481,18 @@ function slash(
 
 4. **EigenLayer Dependency**: Slashing execution depends on EigenLayer infrastructure. Alternative slashing mechanisms not supported.
 
-5. **Funds Burned Not Redistributed**: Currently EigenLayer burns slashed ERC20s and locks slashed ETH. Challenger rewards require separate mechanism.
-
-6. **Single Operator Set**: Initial implementation uses one operator set. Multiple sets (e.g., by chain) may be added later.
-
 ---
 
 ## 9. Open Questions
 
 | # | Question | Impact | Status |
 |---|----------|--------|--------|
-| 1 | What is the appropriate challenge window duration? | Security vs. finality tradeoff | **Suggested: 7 days (≤14 to ensure slashability)** |
-| 2 | Should challengers receive rewards from slashed stake? | Incentive alignment | **TBD - EigenLayer burns funds currently** |
+| 1 | What is the appropriate challenge window duration? | Security vs. finality tradeoff | **Suggested: 7 days** |
+| 2 | Should challengers receive rewards from slashed stake? | Incentive alignment | **TBD - separate spec** |
 | 3 | How to handle the case where a contract self-destructs? | Edge case in verification | **Low priority** |
 | 4 | Should we support batched slashing for multiple frauds? | Gas efficiency | **Future optimization** |
-| 5 | What minimum stake is required for operators to be slashable? | Economic security threshold | **Suggested: 0.1e18 (10%) magnitude allocation** |
+| 5 | What minimum stake is required for operators to be slashable? | Economic security threshold | **Defer to EigenLayer params** |
 | 6 | How do we handle upgrades to the SP1 program (new vkey)? | Version management | **Registry contract needed** |
-| 7 | What strategies should be slashable (stETH, rETH, native ETH)? | AVS configuration | **TBD - based on operator composition** |
-| 8 | Should slash percentage vary by offense severity? | Penalty calibration | **Initial: fixed 10%, future: graduated** |
-| 9 | How to handle operator set migration from AVSDirectory? | EigenLayer upgrade | **Required before enabling slashing** |
 
 ---
 
@@ -774,30 +503,22 @@ function slash(
 | Term | Definition |
 |------|------------|
 | **Aggregate Network** | Set of operators who collectively sign storage updates |
-| **Allocation Manager** | EigenLayer contract that manages stake allocation and executes slashing |
 | **Anchor Hash** | Block hash that anchors EVM execution to a specific Ethereum state |
 | **BLS Signature** | Boneh-Lynn-Shacham signature scheme used for aggregate signatures |
 | **Challenger** | Entity that submits fraud proofs to slash malicious operators |
 | **Commitment** | Cryptographic hash binding operators to specific storage updates |
 | **EIP-4788** | Ethereum improvement storing beacon block roots on-chain |
 | **Helios** | Ethereum light client for trustless block hash verification |
-| **Magnitude** | EigenLayer unit for stake allocation (1e18 = 100% of operator's stake) |
 | **Opcode Hash** | `keccak256` of state-modifying opcodes executed during a call |
-| **Operator Set** | EigenLayer grouping mechanism for operators within an AVS |
 | **Quorum** | Minimum stake threshold (66%) required for valid signatures |
-| **ServiceManager** | AVS contract that interfaces with EigenLayer for operator management |
 | **Slashing** | Penalty mechanism that confiscates operator stake for misbehavior |
 | **SP1** | Succinct's zkVM for generating PLONK proofs of program execution |
 | **Storage Updates** | Array of `(slot, value)` pairs representing state changes |
 | **Transition Index** | Sequential counter preventing replay of signed commitments |
-| **Unique Stake** | EigenLayer feature ensuring stake can only be slashed once per offense |
-| **WAD** | Wei-based decimal unit (1e18 = 100%), used for slash percentages |
 
 ### References
 
 - [EigenLayer Slashing Documentation](https://docs.eigenlayer.xyz/eigenlayer/security/slashing)
-- [EigenLayer AllocationManager](https://github.com/Layr-Labs/eigenlayer-contracts/blob/dev/src/contracts/core/AllocationManager.sol)
-- [EigenLayer SLASHING.md](https://github.com/Layr-Labs/eigenlayer-contracts/blob/dev/docs/core/SLASHING.md)
 - [SP1 Contract Call Repository](https://github.com/succinctlabs/sp1-contract-call)
 - [Helios Light Client](https://github.com/a16z/helios)
 - [EIP-4788: Beacon Block Root in the EVM](https://eips.ethereum.org/EIPS/eip-4788)
@@ -808,38 +529,13 @@ function slash(
 
 ## 11. Implementation Checklist
 
-### Phase 1: Contract Updates
-- [x] Modify `GasKillerSDK.verifyAndUpdate()` to include anchorHash, callerAddress, contractCalldata
-- [x] Update `IGasKillerSDK` interface with new function signature
-- [x] Update `getMessageHash()` helper function
-- [ ] Write unit tests for new message hash format
-
-### Phase 2: EigenLayer Integration
-- [ ] Migrate from AVSDirectory to Operator Sets (if not already done)
-- [ ] Create operator set for aggregate network (operatorSetId = 1)
-- [ ] Define slashable strategies (stETH, rETH, native ETH)
-- [ ] Set minimum allocation requirements (0.1e18 suggested)
-- [ ] Implement `GasKillerServiceManager.requestSlashing()`
-- [ ] Test slashing flow on Holesky testnet
-
-### Phase 3: Slashing Contract
+- [ ] Modify `GasKillerSDK.verifyAndUpdate()` to sign extended commitment
 - [ ] Deploy `GasKillerSlasher` contract
-- [ ] Integrate SP1 Verifier contract (SP1VerifierPlonk)
+- [ ] Integrate SP1 Verifier contract
 - [ ] Deploy/integrate Helios light client (or use EIP-4788)
-- [ ] Implement `slash()` function with fraud detection
-- [ ] Implement `isSlashed()` and challenge window checks
+- [ ] Implement challenger tooling (proof generation scripts)
+- [ ] Add slashing hooks to EigenLayer AVS registration
 - [ ] Write comprehensive test suite for slashing paths
-
-### Phase 4: Challenger Tooling
-- [ ] Create CLI for proof generation from commitment hash
-- [ ] Implement block state fetching at anchor hash
-- [ ] Automate storage update comparison
-- [ ] Build transaction submission for slashing
-
-### Phase 5: Deployment & Operations
-- [ ] Security audit of slashing contract and ServiceManager
-- [ ] Deploy to testnet (Holesky) and validate end-to-end
-- [ ] Test with real EigenLayer testnet operators
-- [ ] Mainnet deployment
-- [ ] Operator onboarding and stake allocation
-- [ ] Monitoring and alerting for fraudulent commitments
+- [ ] Security audit of slashing contract
+- [ ] Deploy to testnet and validate end-to-end flow
+- [ ] Mainnet deployment with operator onboarding
