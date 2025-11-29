@@ -52,8 +52,8 @@ pub mod io;
 
 pub mod inspector;
 pub use inspector::{
-    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, StorageChangeReason,
-    TracingInspector, TracingInspectorConfig,
+    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
+    TracingInspectorConfig,
 };
 
 mod errors;
@@ -165,17 +165,27 @@ sol! {
         bytes contractOutput;
     }
 
+    /// Represents a first-level external call made during contract execution.
+    ///
+    /// This struct captures the target address, calldata, and expected result of an external
+    /// call made directly by the main contract (not nested calls from other contracts).
+    #[derive(Debug, PartialEq, Eq)]
+    struct ExternalCall {
+        address target;         // The contract being called
+        bytes callData;         // The calldata sent to the target
+        bytes expectedResult;   // The return data from the call
+    }
+
     /// Public values of a contract call with opcode tracing.
     ///
     /// Extends [`ContractPublicValues`] with a hash of all opcodes executed during the call
-    /// and a hash of all external storage slots read.
+    /// and an array of first-level external calls made during execution.
     ///
     /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
     /// concatenation of all opcode bytes executed in order.
     ///
-    /// The external storage slots hash is computed as `keccak256(storage_reads)` where
-    /// `storage_reads` is the concatenation of (address, slot) pairs for all SLOAD operations
-    /// on external contracts (i.e., contracts other than the main contract being called).
+    /// The external calls array contains only first-level calls - direct calls made by the
+    /// main contract, not nested calls made by those external contracts.
     #[derive(Debug)]
     struct ContractPublicValuesWithTrace {
         uint256 id;
@@ -187,7 +197,7 @@ sol! {
         bytes contractCalldata;
         bytes contractOutput;
         bytes32 opcodeHash;
-        bytes32 externalStorageSlotsHash;
+        ExternalCall[] externalCalls;
     }
 
     #[derive(Debug)]
@@ -227,7 +237,7 @@ impl ContractPublicValuesWithTrace {
     /// Construct a new [`ContractPublicValuesWithTrace`]
     ///
     /// Similar to [`ContractPublicValues::new`], but includes a hash of all executed opcodes
-    /// and a hash of all external storage slots accessed.
+    /// and an array of first-level external calls made during execution.
     pub fn new(
         call: ContractInput,
         output: Bytes,
@@ -236,7 +246,7 @@ impl ContractPublicValuesWithTrace {
         anchor_type: AnchorType,
         chain_config_hash: B256,
         opcode_hash: B256,
-        external_storage_slots_hash: B256,
+        external_calls: Vec<ExternalCall>,
     ) -> Self {
         Self {
             id,
@@ -248,7 +258,7 @@ impl ContractPublicValuesWithTrace {
             contractCalldata: call.calldata.to_bytes(),
             contractOutput: output,
             opcodeHash: opcode_hash,
-            externalStorageSlotsHash: external_storage_slots_hash,
+            externalCalls: external_calls,
         }
     }
 }
@@ -384,14 +394,13 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     /// Executes the smart contract call with opcode tracing enabled.
     ///
     /// Returns [`ContractPublicValuesWithTrace`] which includes a hash of all executed opcodes
-    /// and a hash of all external storage slots read.
+    /// and an array of first-level external calls made during execution.
     ///
     /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
     /// concatenation of all opcode bytes executed in order across all call frames.
     ///
-    /// The external storage slots hash is computed as `keccak256(storage_reads)` where
-    /// `storage_reads` is the concatenation of (address, slot) pairs for all SLOAD
-    /// operations on external contracts.
+    /// The external calls array contains only first-level calls - direct calls made by the
+    /// main contract, not nested calls made by those external contracts.
     ///
     /// Note: It's the caller's responsability to commit the public values returned by
     /// this function. [`execute_with_trace_and_commit`] can be used instead of this function
@@ -402,7 +411,6 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
         &self,
         call: ContractInput,
     ) -> eyre::Result<ContractPublicValuesWithTrace> {
-        let main_contract = call.contract_address;
         let cache_db = CacheDB::new(&self.witness_db);
         let (tx_output, trace) = P::transact_with_trace(
             &call,
@@ -419,9 +427,8 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
         };
 
-        // Compute both hashes in a single pass over the trace
-        let (opcode_hash, external_storage_slots_hash) =
-            compute_trace_hashes(&trace, main_contract);
+        // Compute opcode hash and extract first-level external calls
+        let (opcode_hash, external_calls) = compute_trace_data(&trace);
 
         let public_values = ContractPublicValuesWithTrace::new(
             call,
@@ -431,7 +438,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.anchor.ty,
             self.chain_config_hash,
             opcode_hash,
-            external_storage_slots_hash,
+            external_calls,
         );
 
         Ok(public_values)
@@ -556,48 +563,47 @@ pub fn is_state_modifying_opcode(opcode: u8) -> bool {
     )
 }
 
-/// Computes hashes of execution trace data in a single pass.
+/// Computes trace data including opcode hash and first-level external calls.
 ///
 /// Returns a tuple of:
 /// 1. `opcode_hash`: `keccak256(opcode_bytes)` where `opcode_bytes` is the concatenation of
 ///    state-modifying opcode bytes (SSTORE, CALL, LOG0-LOG4) executed in order.
-/// 2. `external_storage_slots_hash`: `keccak256(storage_reads)` where `storage_reads`
-///    is the concatenation of `(address || slot)` pairs for all SLOAD operations on
-///    contracts other than the main contract (external storage reads only).
+/// 2. `external_calls`: Array of [`ExternalCall`] structs representing first-level external
+///    calls made by the main contract. Only direct children of the root call are included,
+///    not nested calls made by those external contracts.
 ///
 /// # Arguments
 ///
 /// * `trace` - The call trace arena containing execution traces
-/// * `main_contract` - The address of the main contract being called (storage reads from
-///   this contract are excluded from the external storage hash)
-pub fn compute_trace_hashes(trace: &CallTraceArena, main_contract: Address) -> (B256, B256) {
+pub fn compute_trace_data(trace: &CallTraceArena) -> (B256, Vec<ExternalCall>) {
     let mut opcode_bytes: Vec<u8> = Vec::new();
-    let mut storage_bytes: Vec<u8> = Vec::new();
+    let mut external_calls: Vec<ExternalCall> = Vec::new();
 
+    // Collect state-modifying opcodes from all nodes
     for node in trace.nodes() {
-        let is_external = node.trace.address != main_contract;
-        let contract_address = node.trace.address;
-
         for step in &node.trace.steps {
-            // Collect state-modifying opcodes
             let op = step.op.get();
             if is_state_modifying_opcode(op) {
                 opcode_bytes.push(op);
             }
+        }
+    }
 
-            // Collect external storage reads (SLOAD only, not SSTORE)
-            if is_external {
-                if let Some(storage_change) = &step.storage_change {
-                    if storage_change.reason == StorageChangeReason::SLOAD {
-                        // Append contract address (20 bytes)
-                        storage_bytes.extend_from_slice(contract_address.as_slice());
-                        // Append storage slot (32 bytes as big-endian)
-                        storage_bytes.extend_from_slice(&storage_change.key.to_be_bytes::<32>());
-                    }
-                }
+    // Extract first-level external calls (direct children of root node at index 0)
+    let nodes = trace.nodes();
+    if !nodes.is_empty() {
+        let root_node = &nodes[0];
+        for &child_idx in &root_node.children {
+            if let Some(child_node) = nodes.get(child_idx) {
+                let call_trace = &child_node.trace;
+                external_calls.push(ExternalCall {
+                    target: call_trace.address,
+                    callData: call_trace.data.clone(),
+                    expectedResult: call_trace.output.clone(),
+                });
             }
         }
     }
 
-    (keccak256(&opcode_bytes), keccak256(&storage_bytes))
+    (keccak256(&opcode_bytes), external_calls)
 }
