@@ -78,6 +78,9 @@ where
     /// Returns both the call result and the execution trace containing all opcodes executed.
     /// The accessed accounts and storages are recorded, and included in a [`EvmSketchInput`]
     /// when [`Self::finalize`] is called.
+    ///
+    /// Note: This method is async for API consistency with other methods, though the
+    /// underlying execution is synchronous.
     pub async fn call_with_trace<C: SolCall>(
         &self,
         contract_address: Address,

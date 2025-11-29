@@ -8,7 +8,7 @@
 //!     --block 20600000
 
 use alloy_primitives::Address;
-use eyre::Result;
+use eyre::{bail, Result, WrapErr};
 use opcode_tracer::{trace_call, TraceConfig};
 use std::env;
 
@@ -18,17 +18,27 @@ async fn main() -> Result<()> {
 
     let rpc_url = get_arg(&args, "--rpc-url")
         .or_else(|| env::var("ETH_RPC_URL").ok())
-        .expect("--rpc-url or ETH_RPC_URL required");
+        .ok_or_else(|| eyre::eyre!("--rpc-url or ETH_RPC_URL environment variable required"))?;
 
-    let contract: Address = get_arg(&args, "--contract")
-        .expect("--contract required")
+    let contract_str = get_arg(&args, "--contract")
+        .ok_or_else(|| eyre::eyre!("--contract required"))?;
+    let contract: Address = contract_str
         .parse()
-        .expect("invalid contract address");
+        .wrap_err_with(|| format!("invalid contract address: {contract_str}"))?;
 
-    let selector = get_arg(&args, "--selector").expect("--selector required");
-    let selector = hex::decode(selector.trim_start_matches("0x")).expect("invalid selector hex");
+    let selector_str = get_arg(&args, "--selector")
+        .ok_or_else(|| eyre::eyre!("--selector required (4-byte function selector, e.g., 0x3850c7bd)"))?;
+    let selector = hex::decode(selector_str.trim_start_matches("0x"))
+        .wrap_err_with(|| format!("invalid selector hex: {selector_str}"))?;
 
-    let block_number = get_arg(&args, "--block").map(|s| s.parse::<u64>().expect("invalid block"));
+    if selector.len() != 4 {
+        bail!("selector must be exactly 4 bytes, got {} bytes", selector.len());
+    }
+
+    let block_number = match get_arg(&args, "--block") {
+        Some(s) => Some(s.parse::<u64>().wrap_err_with(|| format!("invalid block number: {s}"))?),
+        None => None,
+    };
 
     let config = TraceConfig {
         rpc_url,
