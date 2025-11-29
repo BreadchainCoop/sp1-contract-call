@@ -66,6 +66,8 @@ pub struct OpcodeExecution {
     pub gas_remaining: u64,
     /// Gas cost of this step.
     pub gas_cost: u64,
+    /// Call depth (1 = top level, 2 = first nested call, etc.)
+    pub depth: usize,
     /// Stack snapshot at this step (top of stack is index 0).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<U256>,
@@ -180,6 +182,9 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
     let mut total_gas_used = 0u64;
 
     for node in nodes {
+        // Call depth: 0-indexed in trace, we use 1-indexed (1 = top level)
+        let depth = node.trace.depth as usize + 1;
+
         for step in &node.trace.steps {
             let name = step.op.as_str().to_string();
 
@@ -210,6 +215,7 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
                 name,
                 gas_remaining: step.gas_remaining,
                 gas_cost: step.gas_cost,
+                depth,
                 stack,
                 memory,
                 storage_change,
@@ -259,6 +265,7 @@ mod tests {
             name: "PUSH1".to_string(),
             gas_remaining: 1000000,
             gas_cost: 3,
+            depth: 1,
             stack: vec![U256::from(42)],
             memory: vec![],
             storage_change: None,
@@ -269,6 +276,7 @@ mod tests {
 
         assert_eq!(parsed.opcode, 0x60);
         assert_eq!(parsed.name, "PUSH1");
+        assert_eq!(parsed.depth, 1);
         assert_eq!(parsed.stack.len(), 1);
     }
 
@@ -280,6 +288,7 @@ mod tests {
             name: "SSTORE".to_string(),
             gas_remaining: 500000,
             gas_cost: 20000,
+            depth: 2,
             stack: vec![U256::from(1), U256::from(42)], // slot, value
             memory: vec![],
             storage_change: Some(StorageChange {
