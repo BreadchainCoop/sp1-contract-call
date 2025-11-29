@@ -9,6 +9,7 @@
 //! - [`ClientExecutor`]: The primary executor for smart contract calls in zkVM
 //! - [`ContractInput`]: Input specification for contract calls and creations
 //! - [`ContractPublicValues`]: Public outputs that can be verified on-chain
+//! - [`ContractPublicValuesWithTrace`]: Public outputs with opcode hash for tracing
 //! - [`Anchor`]: Various blockchain anchoring mechanisms for state validation
 //!
 //! ## Features
@@ -18,6 +19,7 @@
 //! - Support for multiple anchor types (block hash, EIP-4788, consensus)
 //! - Log filtering and event decoding
 //! - Zero-knowledge proof generation for contract execution
+//! - Opcode tracing with hash commitment for execution verification
 
 use std::sync::Arc;
 
@@ -163,6 +165,24 @@ sol! {
         bytes contractOutput;
     }
 
+    /// Public values of a contract call with opcode tracing.
+    ///
+    /// Extends [`ContractPublicValues`] with a hash of all opcodes executed during the call.
+    /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
+    /// concatenation of all opcode bytes executed in order.
+    #[derive(Debug)]
+    struct ContractPublicValuesWithTrace {
+        uint256 id;
+        bytes32 anchorHash;
+        AnchorType anchorType;
+        bytes32 chainConfigHash;
+        address callerAddress;
+        address contractAddress;
+        bytes contractCalldata;
+        bytes contractOutput;
+        bytes32 opcodeHash;
+    }
+
     #[derive(Debug)]
     struct ChainConfig {
         uint chainId;
@@ -192,6 +212,33 @@ impl ContractPublicValues {
             callerAddress: call.caller_address,
             contractCalldata: call.calldata.to_bytes(),
             contractOutput: output,
+        }
+    }
+}
+
+impl ContractPublicValuesWithTrace {
+    /// Construct a new [`ContractPublicValuesWithTrace`]
+    ///
+    /// Similar to [`ContractPublicValues::new`], but includes a hash of all executed opcodes.
+    pub fn new(
+        call: ContractInput,
+        output: Bytes,
+        id: U256,
+        anchor: B256,
+        anchor_type: AnchorType,
+        chain_config_hash: B256,
+        opcode_hash: B256,
+    ) -> Self {
+        Self {
+            id,
+            anchorHash: anchor,
+            anchorType: anchor_type,
+            chainConfigHash: chain_config_hash,
+            contractAddress: call.contract_address,
+            callerAddress: call.caller_address,
+            contractCalldata: call.calldata.to_bytes(),
+            contractOutput: output,
+            opcodeHash: opcode_hash,
         }
     }
 }
@@ -324,6 +371,63 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
+    /// Executes the smart contract call with opcode tracing enabled.
+    ///
+    /// Returns [`ContractPublicValuesWithTrace`] which includes a hash of all executed opcodes.
+    /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
+    /// concatenation of all opcode bytes executed in order across all call frames.
+    ///
+    /// Note: It's the caller's responsability to commit the public values returned by
+    /// this function. [`execute_with_trace_and_commit`] can be used instead of this function
+    /// to automatically commit if the execution is successful.
+    ///
+    /// [`execute_with_trace_and_commit`]: ClientExecutor::execute_with_trace_and_commit
+    pub fn execute_with_trace(
+        &self,
+        call: ContractInput,
+    ) -> eyre::Result<ContractPublicValuesWithTrace> {
+        let cache_db = CacheDB::new(&self.witness_db);
+        let (tx_output, trace) = P::transact_with_trace(
+            &call,
+            cache_db,
+            self.header,
+            U256::ZERO,
+            self.chain_spec.clone(),
+        )
+        .unwrap();
+
+        let tx_output_bytes = match tx_output.result {
+            ExecutionResult::Success { output, .. } => output.data().clone(),
+            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
+            ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
+        };
+
+        // Compute opcode hash: collect all opcode bytes from all call frames and hash them
+        let opcode_hash = compute_opcode_hash(&trace);
+
+        let public_values = ContractPublicValuesWithTrace::new(
+            call,
+            tx_output_bytes,
+            self.anchor.id,
+            self.anchor.hash,
+            self.anchor.ty,
+            self.chain_config_hash,
+            opcode_hash,
+        );
+
+        Ok(public_values)
+    }
+
+    /// Executes the smart contract call with opcode tracing enabled and commits the result.
+    ///
+    /// This is the tracing equivalent of [`execute_and_commit`].
+    ///
+    /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
+    pub fn execute_with_trace_and_commit(&self, call: ContractInput) {
+        let public_values = self.execute_with_trace(call).unwrap();
+        sp1_zkvm::io::commit_slice(&public_values.abi_encode());
+    }
+
     /// Returns the decoded logs matching the provided `filter`.
     ///
     /// To be available in the client, the logs need to be prefetched in the host first.
@@ -391,4 +495,23 @@ pub fn verifiy_chain_config_optimism(
     } else {
         Err(ClientError::InvalidChainConfig)
     }
+}
+
+/// Computes a hash of all opcodes executed during an EVM call.
+///
+/// This function collects all opcode bytes from all call frames in the trace
+/// and returns `keccak256(opcode_bytes)` where `opcode_bytes` is the
+/// concatenation of all opcode bytes executed in order.
+///
+/// The resulting hash can be used to verify that a specific sequence of opcodes
+/// was executed during a contract call.
+pub fn compute_opcode_hash(trace: &CallTraceArena) -> B256 {
+    // Collect all opcode bytes from all call frames in execution order
+    let opcode_bytes: Vec<u8> = trace
+        .nodes()
+        .iter()
+        .flat_map(|node| node.trace.steps.iter().map(|step| step.op.get()))
+        .collect();
+
+    keccak256(&opcode_bytes)
 }
