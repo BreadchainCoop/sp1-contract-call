@@ -497,20 +497,71 @@ pub fn verifiy_chain_config_optimism(
     }
 }
 
-/// Computes a hash of all opcodes executed during an EVM call.
+/// Opcode byte values for state-modifying operations.
+/// These are the only opcodes included in the opcode hash.
+mod state_opcodes {
+    /// SSTORE - Storage write
+    pub(super) const SSTORE: u8 = 0x55;
+    /// CALL - External call
+    pub(super) const CALL: u8 = 0xF1;
+    /// LOG0 - Event with no topics
+    pub(super) const LOG0: u8 = 0xA0;
+    /// LOG1 - Event with 1 topic
+    pub(super) const LOG1: u8 = 0xA1;
+    /// LOG2 - Event with 2 topics
+    pub(super) const LOG2: u8 = 0xA2;
+    /// LOG3 - Event with 3 topics
+    pub(super) const LOG3: u8 = 0xA3;
+    /// LOG4 - Event with 4 topics
+    pub(super) const LOG4: u8 = 0xA4;
+}
+
+/// Returns true if the opcode is a state-modifying operation that should be
+/// included in the opcode hash.
 ///
-/// This function collects all opcode bytes from all call frames in the trace
-/// and returns `keccak256(opcode_bytes)` where `opcode_bytes` is the
-/// concatenation of all opcode bytes executed in order.
+/// State-modifying opcodes are:
+/// - SSTORE (0x55): Storage writes
+/// - CALL (0xF1): External calls
+/// - LOG0-LOG4 (0xA0-0xA4): Event emissions
+#[inline]
+pub fn is_state_modifying_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        state_opcodes::SSTORE
+            | state_opcodes::CALL
+            | state_opcodes::LOG0
+            | state_opcodes::LOG1
+            | state_opcodes::LOG2
+            | state_opcodes::LOG3
+            | state_opcodes::LOG4
+    )
+}
+
+/// Computes a hash of state-modifying opcodes executed during an EVM call.
 ///
-/// The resulting hash can be used to verify that a specific sequence of opcodes
-/// was executed during a contract call.
+/// This function collects only state-modifying opcode bytes (SSTORE, CALL, LOG0-LOG4)
+/// from all call frames in the trace and returns `keccak256(opcode_bytes)` where
+/// `opcode_bytes` is the concatenation of these opcode bytes executed in order.
+///
+/// Only the following opcodes are included:
+/// - SSTORE (0x55): Storage writes
+/// - CALL (0xF1): External calls
+/// - LOG0-LOG4 (0xA0-0xA4): Event emissions
+///
+/// This matches the state update logic used by gas-killer-analyzer, which tracks
+/// only operations that modify blockchain state.
 pub fn compute_opcode_hash(trace: &CallTraceArena) -> B256 {
-    // Collect all opcode bytes from all call frames in execution order
+    // Collect only state-modifying opcode bytes from all call frames in execution order
     let opcode_bytes: Vec<u8> = trace
         .nodes()
         .iter()
-        .flat_map(|node| node.trace.steps.iter().map(|step| step.op.get()))
+        .flat_map(|node| {
+            node.trace
+                .steps
+                .iter()
+                .map(|step| step.op.get())
+                .filter(|&op| is_state_modifying_opcode(op))
+        })
         .collect();
 
     keccak256(&opcode_bytes)
