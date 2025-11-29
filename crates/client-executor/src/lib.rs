@@ -572,10 +572,27 @@ pub fn is_state_modifying_opcode(opcode: u8) -> bool {
 ///    calls made by the main contract. Only direct children of the root call are included,
 ///    not nested calls made by those external contracts.
 ///
+/// # Proxy Pattern Support
+///
+/// For transparent upgradeable proxies, this function correctly captures the proxy address
+/// (not the implementation address) because:
+/// - First-level children represent CALL/STATICCALL to the proxy
+/// - The proxy's internal DELEGATECALL to implementation creates nested children
+/// - We only capture first-level children, so we get the stable proxy address
+///
+/// At verification time, calling `proxy.staticcall(callData)` goes through the proxy's
+/// fallback and delegates to the current implementation. If the implementation changed,
+/// the result may differ, causing verification to fail (correct behavior).
+///
+/// Note: DELEGATECALL operations at the first level are excluded since they execute
+/// code in the caller's context, making the `address` field unreliable for verification.
+///
 /// # Arguments
 ///
 /// * `trace` - The call trace arena containing execution traces
 pub fn compute_trace_data(trace: &CallTraceArena) -> (B256, Vec<ExternalCall>) {
+    use revm_inspectors::tracing::types::CallKind;
+
     let mut opcode_bytes: Vec<u8> = Vec::new();
     let mut external_calls: Vec<ExternalCall> = Vec::new();
 
@@ -590,17 +607,29 @@ pub fn compute_trace_data(trace: &CallTraceArena) -> (B256, Vec<ExternalCall>) {
     }
 
     // Extract first-level external calls (direct children of root node at index 0)
+    // Only include CALL and STATICCALL operations - DELEGATECALL executes in the
+    // caller's context so the address field would be misleading for verification.
     let nodes = trace.nodes();
     if !nodes.is_empty() {
         let root_node = &nodes[0];
         for &child_idx in &root_node.children {
             if let Some(child_node) = nodes.get(child_idx) {
                 let call_trace = &child_node.trace;
-                external_calls.push(ExternalCall {
-                    target: call_trace.address,
-                    callData: call_trace.data.clone(),
-                    expectedResult: call_trace.output.clone(),
-                });
+
+                // Only capture CALL and STATICCALL - these have reliable target addresses
+                // DELEGATECALL and CALLCODE execute remote code in local context,
+                // making their address field unsuitable for external verification
+                match call_trace.kind {
+                    CallKind::Call | CallKind::StaticCall => {
+                        external_calls.push(ExternalCall {
+                            target: call_trace.address,
+                            callData: call_trace.data.clone(),
+                            expectedResult: call_trace.output.clone(),
+                        });
+                    }
+                    // Skip DELEGATECALL, CALLCODE, and CREATE variants
+                    _ => {}
+                }
             }
         }
     }
