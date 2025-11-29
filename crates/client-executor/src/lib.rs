@@ -52,8 +52,8 @@ pub mod io;
 
 pub mod inspector;
 pub use inspector::{
-    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
-    TracingInspectorConfig,
+    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, StorageChangeReason,
+    TracingInspector, TracingInspectorConfig,
 };
 
 mod errors;
@@ -167,9 +167,15 @@ sol! {
 
     /// Public values of a contract call with opcode tracing.
     ///
-    /// Extends [`ContractPublicValues`] with a hash of all opcodes executed during the call.
+    /// Extends [`ContractPublicValues`] with a hash of all opcodes executed during the call
+    /// and a hash of all external storage slots read.
+    ///
     /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
     /// concatenation of all opcode bytes executed in order.
+    ///
+    /// The external storage slots hash is computed as `keccak256(storage_reads)` where
+    /// `storage_reads` is the concatenation of (address, slot) pairs for all SLOAD operations
+    /// on external contracts (i.e., contracts other than the main contract being called).
     #[derive(Debug)]
     struct ContractPublicValuesWithTrace {
         uint256 id;
@@ -181,6 +187,7 @@ sol! {
         bytes contractCalldata;
         bytes contractOutput;
         bytes32 opcodeHash;
+        bytes32 externalStorageSlotsHash;
     }
 
     #[derive(Debug)]
@@ -219,7 +226,8 @@ impl ContractPublicValues {
 impl ContractPublicValuesWithTrace {
     /// Construct a new [`ContractPublicValuesWithTrace`]
     ///
-    /// Similar to [`ContractPublicValues::new`], but includes a hash of all executed opcodes.
+    /// Similar to [`ContractPublicValues::new`], but includes a hash of all executed opcodes
+    /// and a hash of all external storage slots accessed.
     pub fn new(
         call: ContractInput,
         output: Bytes,
@@ -228,6 +236,7 @@ impl ContractPublicValuesWithTrace {
         anchor_type: AnchorType,
         chain_config_hash: B256,
         opcode_hash: B256,
+        external_storage_slots_hash: B256,
     ) -> Self {
         Self {
             id,
@@ -239,6 +248,7 @@ impl ContractPublicValuesWithTrace {
             contractCalldata: call.calldata.to_bytes(),
             contractOutput: output,
             opcodeHash: opcode_hash,
+            externalStorageSlotsHash: external_storage_slots_hash,
         }
     }
 }
@@ -373,9 +383,15 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
 
     /// Executes the smart contract call with opcode tracing enabled.
     ///
-    /// Returns [`ContractPublicValuesWithTrace`] which includes a hash of all executed opcodes.
+    /// Returns [`ContractPublicValuesWithTrace`] which includes a hash of all executed opcodes
+    /// and a hash of all external storage slots read.
+    ///
     /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
     /// concatenation of all opcode bytes executed in order across all call frames.
+    ///
+    /// The external storage slots hash is computed as `keccak256(storage_reads)` where
+    /// `storage_reads` is the concatenation of (address, slot) pairs for all SLOAD
+    /// operations on external contracts.
     ///
     /// Note: It's the caller's responsability to commit the public values returned by
     /// this function. [`execute_with_trace_and_commit`] can be used instead of this function
@@ -386,6 +402,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
         &self,
         call: ContractInput,
     ) -> eyre::Result<ContractPublicValuesWithTrace> {
+        let main_contract = call.contract_address;
         let cache_db = CacheDB::new(&self.witness_db);
         let (tx_output, trace) = P::transact_with_trace(
             &call,
@@ -402,8 +419,9 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
         };
 
-        // Compute opcode hash: collect all opcode bytes from all call frames and hash them
-        let opcode_hash = compute_opcode_hash(&trace);
+        // Compute both hashes in a single pass over the trace
+        let (opcode_hash, external_storage_slots_hash) =
+            compute_trace_hashes(&trace, main_contract);
 
         let public_values = ContractPublicValuesWithTrace::new(
             call,
@@ -413,6 +431,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.anchor.ty,
             self.chain_config_hash,
             opcode_hash,
+            external_storage_slots_hash,
         );
 
         Ok(public_values)
@@ -537,32 +556,48 @@ pub fn is_state_modifying_opcode(opcode: u8) -> bool {
     )
 }
 
-/// Computes a hash of state-modifying opcodes executed during an EVM call.
+/// Computes hashes of execution trace data in a single pass.
 ///
-/// This function collects only state-modifying opcode bytes (SSTORE, CALL, LOG0-LOG4)
-/// from all call frames in the trace and returns `keccak256(opcode_bytes)` where
-/// `opcode_bytes` is the concatenation of these opcode bytes executed in order.
+/// Returns a tuple of:
+/// 1. `opcode_hash`: `keccak256(opcode_bytes)` where `opcode_bytes` is the concatenation of
+///    state-modifying opcode bytes (SSTORE, CALL, LOG0-LOG4) executed in order.
+/// 2. `external_storage_slots_hash`: `keccak256(storage_reads)` where `storage_reads`
+///    is the concatenation of `(address || slot)` pairs for all SLOAD operations on
+///    contracts other than the main contract (external storage reads only).
 ///
-/// Only the following opcodes are included:
-/// - SSTORE (0x55): Storage writes
-/// - CALL (0xF1): External calls
-/// - LOG0-LOG4 (0xA0-0xA4): Event emissions
+/// # Arguments
 ///
-/// This matches the state update logic used by gas-killer-analyzer, which tracks
-/// only operations that modify blockchain state.
-pub fn compute_opcode_hash(trace: &CallTraceArena) -> B256 {
-    // Collect only state-modifying opcode bytes from all call frames in execution order
-    let opcode_bytes: Vec<u8> = trace
-        .nodes()
-        .iter()
-        .flat_map(|node| {
-            node.trace
-                .steps
-                .iter()
-                .map(|step| step.op.get())
-                .filter(|&op| is_state_modifying_opcode(op))
-        })
-        .collect();
+/// * `trace` - The call trace arena containing execution traces
+/// * `main_contract` - The address of the main contract being called (storage reads from
+///   this contract are excluded from the external storage hash)
+pub fn compute_trace_hashes(trace: &CallTraceArena, main_contract: Address) -> (B256, B256) {
+    let mut opcode_bytes: Vec<u8> = Vec::new();
+    let mut storage_bytes: Vec<u8> = Vec::new();
 
-    keccak256(&opcode_bytes)
+    for node in trace.nodes() {
+        let is_external = node.trace.address != main_contract;
+        let contract_address = node.trace.address;
+
+        for step in &node.trace.steps {
+            // Collect state-modifying opcodes
+            let op = step.op.get();
+            if is_state_modifying_opcode(op) {
+                opcode_bytes.push(op);
+            }
+
+            // Collect external storage reads (SLOAD only, not SSTORE)
+            if is_external {
+                if let Some(storage_change) = &step.storage_change {
+                    if storage_change.reason == StorageChangeReason::SLOAD {
+                        // Append contract address (20 bytes)
+                        storage_bytes.extend_from_slice(contract_address.as_slice());
+                        // Append storage slot (32 bytes as big-endian)
+                        storage_bytes.extend_from_slice(&storage_change.key.to_be_bytes::<32>());
+                    }
+                }
+            }
+        }
+    }
+
+    (keccak256(&opcode_bytes), keccak256(&storage_bytes))
 }

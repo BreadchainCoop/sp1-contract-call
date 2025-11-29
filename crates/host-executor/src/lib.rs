@@ -22,8 +22,8 @@ pub use sketch::EvmSketch;
 
 // Re-export tracing types for convenience
 pub use sp1_cc_client_executor::{
-    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
-    TracingInspectorConfig,
+    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, StorageChangeReason,
+    TracingInspector, TracingInspectorConfig,
 };
 
 mod sketch_builder;
