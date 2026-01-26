@@ -42,6 +42,10 @@ struct Args {
     #[clap(long)]
     prove: bool,
 
+    /// Enable opcode tracing and print the execution trace
+    #[clap(long)]
+    trace: bool,
+
     #[clap(long, env)]
     eth_rpc_url: Url,
 }
@@ -87,7 +91,55 @@ async fn main() -> eyre::Result<()> {
 
     // Make the call to the slot0 function.
     let slot0_call = IUniswapV3PoolState::slot0Call {};
-    let _price_x96_bytes = sketch.call(CONTRACT, Address::default(), slot0_call).await?;
+
+    if args.trace {
+        // Use call_with_trace to capture opcodes
+        let (_price_x96_bytes, trace) =
+            sketch.call_with_trace(CONTRACT, Address::default(), slot0_call).await?;
+
+        // Collect all opcode steps from all call nodes
+        let all_steps: Vec<_> = trace
+            .nodes()
+            .iter()
+            .flat_map(|node| node.trace.steps.iter())
+            .collect();
+
+        println!("\n=== Execution Trace ===");
+        println!("Total opcodes executed: {}", all_steps.len());
+        println!("Call frames: {}", trace.nodes().len());
+        println!("\nOpcode sequence:");
+
+        // Print first 50 opcodes for brevity
+        for (i, step) in all_steps.iter().take(50).enumerate() {
+            let op_name = step.op.as_str();
+            let stack_size = step.stack.as_ref().map(|s| s.len()).unwrap_or(0);
+            println!(
+                "  {:4}: PC={:5} | {:12} | gas={:8} | cost={:4} | stack_size={}",
+                i, step.pc, op_name, step.gas_remaining, step.gas_cost, stack_size
+            );
+        }
+
+        if all_steps.len() > 50 {
+            println!("  ... ({} more opcodes)", all_steps.len() - 50);
+        }
+
+        // Print opcode frequency
+        let mut opcode_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for step in &all_steps {
+            *opcode_counts.entry(step.op.as_str()).or_insert(0) += 1;
+        }
+        let mut counts: Vec<_> = opcode_counts.into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+
+        println!("\nOpcode frequency (top 20):");
+        for (opcode, count) in counts.iter().take(20) {
+            println!("  {:12}: {:5} times", opcode, count);
+        }
+        println!("======================\n");
+    } else {
+        let _price_x96_bytes = sketch.call(CONTRACT, Address::default(), slot0_call).await?;
+    }
 
     // Now that we've executed all of the calls, get the `EVMStateSketch` from the host executor.
     let input = sketch.finalize().await?;

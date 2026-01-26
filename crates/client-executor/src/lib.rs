@@ -9,6 +9,7 @@
 //! - [`ClientExecutor`]: The primary executor for smart contract calls in zkVM
 //! - [`ContractInput`]: Input specification for contract calls and creations
 //! - [`ContractPublicValues`]: Public outputs that can be verified on-chain
+//! - [`ContractPublicValuesWithTrace`]: Public outputs with opcode hash for tracing
 //! - [`Anchor`]: Various blockchain anchoring mechanisms for state validation
 //!
 //! ## Features
@@ -18,6 +19,7 @@
 //! - Support for multiple anchor types (block hash, EIP-4788, consensus)
 //! - Log filtering and event decoding
 //! - Zero-knowledge proof generation for contract execution
+//! - Opcode tracing with hash commitment for execution verification
 
 use std::sync::Arc;
 
@@ -47,6 +49,12 @@ pub use anchor::{
 };
 
 pub mod io;
+
+pub mod inspector;
+pub use inspector::{
+    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
+    TracingInspectorConfig,
+};
 
 mod errors;
 pub use errors::ClientError;
@@ -157,6 +165,41 @@ sol! {
         bytes contractOutput;
     }
 
+    /// Represents a first-level external call made during contract execution.
+    ///
+    /// This struct captures the target address, calldata, and expected result of an external
+    /// call made directly by the main contract (not nested calls from other contracts).
+    #[derive(Debug, PartialEq, Eq)]
+    struct ExternalCall {
+        address target;         // The contract being called
+        bytes callData;         // The calldata sent to the target
+        bytes expectedResult;   // The return data from the call
+    }
+
+    /// Public values of a contract call with opcode tracing.
+    ///
+    /// Extends [`ContractPublicValues`] with a hash of all opcodes executed during the call
+    /// and an array of first-level external calls made during execution.
+    ///
+    /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
+    /// concatenation of all opcode bytes executed in order.
+    ///
+    /// The external calls array contains only first-level calls - direct calls made by the
+    /// main contract, not nested calls made by those external contracts.
+    #[derive(Debug)]
+    struct ContractPublicValuesWithTrace {
+        uint256 id;
+        bytes32 anchorHash;
+        AnchorType anchorType;
+        bytes32 chainConfigHash;
+        address callerAddress;
+        address contractAddress;
+        bytes contractCalldata;
+        bytes contractOutput;
+        bytes32 opcodeHash;
+        ExternalCall[] externalCalls;
+    }
+
     #[derive(Debug)]
     struct ChainConfig {
         uint chainId;
@@ -186,6 +229,36 @@ impl ContractPublicValues {
             callerAddress: call.caller_address,
             contractCalldata: call.calldata.to_bytes(),
             contractOutput: output,
+        }
+    }
+}
+
+impl ContractPublicValuesWithTrace {
+    /// Construct a new [`ContractPublicValuesWithTrace`]
+    ///
+    /// Similar to [`ContractPublicValues::new`], but includes a hash of all executed opcodes
+    /// and an array of first-level external calls made during execution.
+    pub fn new(
+        call: ContractInput,
+        output: Bytes,
+        id: U256,
+        anchor: B256,
+        anchor_type: AnchorType,
+        chain_config_hash: B256,
+        opcode_hash: B256,
+        external_calls: Vec<ExternalCall>,
+    ) -> Self {
+        Self {
+            id,
+            anchorHash: anchor,
+            anchorType: anchor_type,
+            chainConfigHash: chain_config_hash,
+            contractAddress: call.contract_address,
+            callerAddress: call.caller_address,
+            contractCalldata: call.calldata.to_bytes(),
+            contractOutput: output,
+            opcodeHash: opcode_hash,
+            externalCalls: external_calls,
         }
     }
 }
@@ -318,6 +391,69 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
+    /// Executes the smart contract call with opcode tracing enabled.
+    ///
+    /// Returns [`ContractPublicValuesWithTrace`] which includes a hash of all executed opcodes
+    /// and an array of first-level external calls made during execution.
+    ///
+    /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
+    /// concatenation of all opcode bytes executed in order across all call frames.
+    ///
+    /// The external calls array contains only first-level calls - direct calls made by the
+    /// main contract, not nested calls made by those external contracts.
+    ///
+    /// Note: It's the caller's responsability to commit the public values returned by
+    /// this function. [`execute_with_trace_and_commit`] can be used instead of this function
+    /// to automatically commit if the execution is successful.
+    ///
+    /// [`execute_with_trace_and_commit`]: ClientExecutor::execute_with_trace_and_commit
+    pub fn execute_with_trace(
+        &self,
+        call: ContractInput,
+    ) -> eyre::Result<ContractPublicValuesWithTrace> {
+        let cache_db = CacheDB::new(&self.witness_db);
+        let (tx_output, trace) = P::transact_with_trace(
+            &call,
+            cache_db,
+            self.header,
+            U256::ZERO,
+            self.chain_spec.clone(),
+        )
+        .unwrap();
+
+        let tx_output_bytes = match tx_output.result {
+            ExecutionResult::Success { output, .. } => output.data().clone(),
+            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
+            ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
+        };
+
+        // Compute opcode hash and extract first-level external calls
+        let (opcode_hash, external_calls) = compute_trace_data(&trace);
+
+        let public_values = ContractPublicValuesWithTrace::new(
+            call,
+            tx_output_bytes,
+            self.anchor.id,
+            self.anchor.hash,
+            self.anchor.ty,
+            self.chain_config_hash,
+            opcode_hash,
+            external_calls,
+        );
+
+        Ok(public_values)
+    }
+
+    /// Executes the smart contract call with opcode tracing enabled and commits the result.
+    ///
+    /// This is the tracing equivalent of [`execute_and_commit`].
+    ///
+    /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
+    pub fn execute_with_trace_and_commit(&self, call: ContractInput) {
+        let public_values = self.execute_with_trace(call).unwrap();
+        sp1_zkvm::io::commit_slice(&public_values.abi_encode());
+    }
+
     /// Returns the decoded logs matching the provided `filter`.
     ///
     /// To be available in the client, the logs need to be prefetched in the host first.
@@ -385,4 +521,118 @@ pub fn verifiy_chain_config_optimism(
     } else {
         Err(ClientError::InvalidChainConfig)
     }
+}
+
+/// Opcode byte values for state-modifying operations.
+/// These are the only opcodes included in the opcode hash.
+mod state_opcodes {
+    /// SSTORE - Storage write
+    pub(super) const SSTORE: u8 = 0x55;
+    /// CALL - External call
+    pub(super) const CALL: u8 = 0xF1;
+    /// LOG0 - Event with no topics
+    pub(super) const LOG0: u8 = 0xA0;
+    /// LOG1 - Event with 1 topic
+    pub(super) const LOG1: u8 = 0xA1;
+    /// LOG2 - Event with 2 topics
+    pub(super) const LOG2: u8 = 0xA2;
+    /// LOG3 - Event with 3 topics
+    pub(super) const LOG3: u8 = 0xA3;
+    /// LOG4 - Event with 4 topics
+    pub(super) const LOG4: u8 = 0xA4;
+}
+
+/// Returns true if the opcode is a state-modifying operation that should be
+/// included in the opcode hash.
+///
+/// State-modifying opcodes are:
+/// - SSTORE (0x55): Storage writes
+/// - CALL (0xF1): External calls
+/// - LOG0-LOG4 (0xA0-0xA4): Event emissions
+#[inline]
+pub fn is_state_modifying_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        state_opcodes::SSTORE
+            | state_opcodes::CALL
+            | state_opcodes::LOG0
+            | state_opcodes::LOG1
+            | state_opcodes::LOG2
+            | state_opcodes::LOG3
+            | state_opcodes::LOG4
+    )
+}
+
+/// Computes trace data including opcode hash and first-level external calls.
+///
+/// Returns a tuple of:
+/// 1. `opcode_hash`: `keccak256(opcode_bytes)` where `opcode_bytes` is the concatenation of
+///    state-modifying opcode bytes (SSTORE, CALL, LOG0-LOG4) executed in order.
+/// 2. `external_calls`: Array of [`ExternalCall`] structs representing first-level external
+///    calls made by the main contract. Only direct children of the root call are included,
+///    not nested calls made by those external contracts.
+///
+/// # Proxy Pattern Support
+///
+/// For transparent upgradeable proxies, this function correctly captures the proxy address
+/// (not the implementation address) because:
+/// - First-level children represent CALL/STATICCALL to the proxy
+/// - The proxy's internal DELEGATECALL to implementation creates nested children
+/// - We only capture first-level children, so we get the stable proxy address
+///
+/// At verification time, calling `proxy.staticcall(callData)` goes through the proxy's
+/// fallback and delegates to the current implementation. If the implementation changed,
+/// the result may differ, causing verification to fail (correct behavior).
+///
+/// Note: DELEGATECALL operations at the first level are excluded since they execute
+/// code in the caller's context, making the `address` field unreliable for verification.
+///
+/// # Arguments
+///
+/// * `trace` - The call trace arena containing execution traces
+pub fn compute_trace_data(trace: &CallTraceArena) -> (B256, Vec<ExternalCall>) {
+    use revm_inspectors::tracing::types::CallKind;
+
+    let mut opcode_bytes: Vec<u8> = Vec::new();
+    let mut external_calls: Vec<ExternalCall> = Vec::new();
+
+    // Collect state-modifying opcodes from all nodes
+    for node in trace.nodes() {
+        for step in &node.trace.steps {
+            let op = step.op.get();
+            if is_state_modifying_opcode(op) {
+                opcode_bytes.push(op);
+            }
+        }
+    }
+
+    // Extract first-level external calls (direct children of root node at index 0)
+    // Only include CALL and STATICCALL operations - DELEGATECALL executes in the
+    // caller's context so the address field would be misleading for verification.
+    let nodes = trace.nodes();
+    if !nodes.is_empty() {
+        let root_node = &nodes[0];
+        for &child_idx in &root_node.children {
+            if let Some(child_node) = nodes.get(child_idx) {
+                let call_trace = &child_node.trace;
+
+                // Only capture CALL and STATICCALL - these have reliable target addresses
+                // DELEGATECALL and CALLCODE execute remote code in local context,
+                // making their address field unsuitable for external verification
+                match call_trace.kind {
+                    CallKind::Call | CallKind::StaticCall => {
+                        external_calls.push(ExternalCall {
+                            target: call_trace.address,
+                            callData: call_trace.data.clone(),
+                            expectedResult: call_trace.output.clone(),
+                        });
+                    }
+                    // Skip DELEGATECALL, CALLCODE, and CREATE variants
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    (keccak256(&opcode_bytes), external_calls)
 }

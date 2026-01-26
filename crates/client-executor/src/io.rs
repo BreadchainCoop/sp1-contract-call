@@ -24,6 +24,8 @@ use revm::{
     state::Bytecode,
     Context, MainBuilder, MainContext,
 };
+
+use crate::inspector::{CallTraceArena, TracingInspector, TracingInspectorConfig};
 use revm_primitives::{B256, U256};
 use rsp_client_executor::{error::ClientError, io::WitnessInput};
 use rsp_mpt::EthereumState;
@@ -102,6 +104,18 @@ pub trait Primitives: NodePrimitives {
     where
         DB: Database;
 
+    /// Execute a contract call with opcode tracing enabled.
+    /// Returns both the execution result and the execution trace.
+    fn transact_with_trace<DB>(
+        input: &ContractInput,
+        db: DB,
+        header: &Header,
+        difficulty: U256,
+        chain_spec: Arc<Self::ChainSpec>,
+    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String>
+    where
+        DB: Database;
+
     fn active_fork_name(chain_spec: &Self::ChainSpec, header: &Header) -> String;
 }
 
@@ -150,6 +164,44 @@ impl Primitives for EthPrimitives {
         let mut evm = EthEvm::new(evm, false);
 
         evm.transact(input).map_err(|err| err.to_string())
+    }
+
+    fn transact_with_trace<DB: Database>(
+        input: &ContractInput,
+        db: DB,
+        header: &Header,
+        difficulty: U256,
+        chain_spec: Arc<Self::ChainSpec>,
+    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
+        let EvmEnv { mut cfg_env, mut block_env, .. } =
+            EthEvmConfig::new(chain_spec).evm_env(header).unwrap();
+
+        // Set the base fee to 0 to enable 0 gas price transactions.
+        block_env.basefee = 0;
+        block_env.difficulty = difficulty;
+        cfg_env.disable_nonce_check = true;
+        cfg_env.disable_balance_check = true;
+        cfg_env.disable_fee_charge = true;
+
+        let inspector = TracingInspector::new(TracingInspectorConfig::default_geth());
+
+        let evm = Context::mainnet()
+            .with_db(db)
+            .with_cfg(cfg_env)
+            .with_block(block_env)
+            .modify_tx_chained(|tx_env| {
+                tx_env.gas_limit = header.gas_limit;
+            })
+            .build_mainnet_with_inspector(inspector);
+
+        let mut evm = EthEvm::new(evm, true);  // true enables inspector
+
+        let result = evm.transact(input).map_err(|err| err.to_string())?;
+
+        // Extract the trace from the inspector
+        let trace = evm.into_inner().inspector.into_traces();
+
+        Ok((result, trace))
     }
 
     fn active_fork_name(chain_spec: &Self::ChainSpec, header: &Header) -> String {
@@ -207,6 +259,19 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         let mut evm = alloy_op_evm::OpEvm::new(evm, false);
 
         evm.transact(input).map_err(|err| err.to_string())
+    }
+
+    fn transact_with_trace<DB: Database>(
+        input: &ContractInput,
+        db: DB,
+        header: &Header,
+        difficulty: U256,
+        chain_spec: Arc<Self::ChainSpec>,
+    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
+        // For Optimism, we currently don't support tracing due to API limitations.
+        // Just run the regular transact and return an empty trace.
+        let result = Self::transact(input, db, header, difficulty, chain_spec)?;
+        Ok((result, CallTraceArena::default()))
     }
 
     fn active_fork_name(chain_spec: &Self::ChainSpec, header: &Header) -> String {
