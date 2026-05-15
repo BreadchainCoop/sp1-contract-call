@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::B256;
 use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use alloy_rpc_client::RpcClient;
@@ -195,20 +195,39 @@ where
 {
     /// Builds an [`EvmSketch`].
     pub async fn build(self) -> Result<EvmSketch<P, PT>, HostError> {
-        let anchor = self.anchor_builder.build(self.block).await?;
-        let block_number = anchor.header().number;
+        let anchor;
+        let state_root;
 
-        let state_root = if self.seed_state_root {
-            let previous_block_id = BlockId::number(block_number - 1);
-            let previous_block = self
-                .provider
-                .get_block(previous_block_id)
-                .await?
-                .ok_or_else(|| HostError::BlockNotFoundError(previous_block_id))?;
-            previous_block.header.state_root
+        if self.seed_state_root {
+            if let BlockId::Number(BlockNumberOrTag::Number(n)) = self.block {
+                // Block number is known upfront — fetch anchor and N-1 block concurrently.
+                let prev_block_id = BlockId::number(n - 1);
+                let (a, prev_block) = tokio::try_join!(
+                    self.anchor_builder.build(self.block),
+                    async { self.provider.get_block(prev_block_id).await.map_err(Into::into) }
+                )?;
+                anchor = a;
+                state_root = prev_block
+                    .ok_or_else(|| HostError::BlockNotFoundError(prev_block_id))?
+                    .header
+                    .state_root;
+            } else {
+                anchor = self.anchor_builder.build(self.block).await?;
+                let block_number = anchor.header().number;
+                let prev_block_id = BlockId::number(block_number - 1);
+                let prev_block = self
+                    .provider
+                    .get_block(prev_block_id)
+                    .await?
+                    .ok_or_else(|| HostError::BlockNotFoundError(prev_block_id))?;
+                state_root = prev_block.header.state_root;
+            }
         } else {
-            B256::ZERO
+            anchor = self.anchor_builder.build(self.block).await?;
+            state_root = B256::ZERO;
         };
+
+        let block_number = anchor.header().number;
 
         let sketch = EvmSketch {
             genesis: self.genesis,
