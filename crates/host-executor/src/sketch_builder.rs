@@ -201,7 +201,10 @@ where
         if self.seed_state_root {
             if let BlockId::Number(BlockNumberOrTag::Number(n)) = self.block {
                 // Block number is known upfront — fetch anchor and N-1 block concurrently.
-                let prev_block_id = BlockId::number(n - 1);
+                let prev_n = n
+                    .checked_sub(1)
+                    .ok_or(HostError::BlockNotFoundError(BlockId::number(0)))?;
+                let prev_block_id = BlockId::number(prev_n);
                 let (a, prev_block) = tokio::try_join!(
                     self.anchor_builder.build(self.block),
                     async { self.provider.get_block(prev_block_id).await.map_err(Into::into) }
@@ -214,7 +217,10 @@ where
             } else {
                 anchor = self.anchor_builder.build(self.block).await?;
                 let block_number = anchor.header().number;
-                let prev_block_id = BlockId::number(block_number - 1);
+                let prev_n = block_number
+                    .checked_sub(1)
+                    .ok_or(HostError::BlockNotFoundError(BlockId::number(0)))?;
+                let prev_block_id = BlockId::number(prev_n);
                 let prev_block = self
                     .provider
                     .get_block(prev_block_id)
