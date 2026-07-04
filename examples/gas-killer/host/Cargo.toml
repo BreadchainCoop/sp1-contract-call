@@ -1,0 +1,60 @@
+[package]
+name = "gas-killer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gas_killer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gas-killer-challenger"
+path = "src/main.rs"
+
+[[bin]]
+name = "gas-killer-watcher"
+path = "src/watcher.rs"
+
+[dependencies]
+# workspace
+sp1-cc-host-executor = { path = "../../../crates/host-executor" }
+sp1-cc-client-executor = { path = "../../../crates/client-executor" }
+gas-killer-primitives = { path = "../primitives" }
+
+# alloy
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types.workspace = true
+alloy-sol-macro.workspace = true
+alloy-provider.workspace = true
+alloy-contract.workspace = true
+alloy-rpc-types = { workspace = true, features = ["eth", "trace"] }
+alloy = { workspace = true, features = ["signer-local", "network", "providers", "contract", "rpc-types"] }
+alloy-genesis = "1.1"
+
+# misc
+url.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+eyre.workspace = true
+bincode.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml = "0.8"
+dotenv.workspace = true
+clap = { version = "4.0", features = ["derive"] }
+hex = "0.4"
+sha2 = "0.10"
+tracing.workspace = true
+
+# sp1
+sp1-sdk.workspace = true
+
+[dev-dependencies]
+alloy-node-bindings.workspace = true
+gas-analyzer-core = { git = "https://github.com/gas-killer/gas-analyzer", rev = "81b1ab9c858206cb7d04fcb9b325a68eaf450eb6" }
+
+[build-dependencies]
+sp1-build.workspace = true
+
+[features]
+default = []
+cuda = ["sp1-sdk/cuda"]

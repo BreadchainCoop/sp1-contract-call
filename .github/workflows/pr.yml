@@ -106,3 +106,29 @@ jobs:
           cd examples/uniswap/contracts
           forge test -vvv
         id: test
+
+  # Gas Killer challenger: build the guest ELF + host and run the pure unit tests on a
+  # standard runner (no proving, no RPC). Validates the examples/gas-killer crates in CI.
+  # Note: for `pull_request` events GitHub uses the base branch's workflow, so this job
+  # takes effect once merged into the base branch.
+  gas-killer-check:
+    name: Gas Killer challenger check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install sp1up
+        run: |
+          curl -L https://sp1.succinct.xyz | bash
+          echo "$HOME/.sp1/bin" >> $GITHUB_PATH
+
+      - name: Install SP1 toolchain
+        run: sp1up
+
+      - name: Build guest + host and run unit tests
+        run: |
+          cargo build --release -p gas-killer
+          cargo test -p gas-killer-primitives
+        env:
+          RUST_BACKTRACE: full
