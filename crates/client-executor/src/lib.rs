@@ -52,7 +52,7 @@ pub mod io;
 
 pub mod inspector;
 pub use inspector::{
-    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
+    CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, GethTraceBuilder, TracingInspector,
     TracingInspectorConfig,
 };
 
@@ -243,6 +243,18 @@ impl ContractPublicValuesWithTrace {
     }
 }
 
+/// The result of a traced contract execution, as returned by
+/// [`ClientExecutor::execute_traced`].
+#[derive(Debug)]
+pub struct TracedExecution {
+    /// The output (return data) of the contract call.
+    pub output: Bytes,
+    /// The gas used by the execution.
+    pub gas_used: u64,
+    /// The recorded call trace arena.
+    pub arena: CallTraceArena,
+}
+
 /// An executor that executes smart contract calls inside a zkVM.
 #[derive(Debug)]
 pub struct ClientExecutor<'a, P: Primitives> {
@@ -393,6 +405,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.header,
             U256::ZERO,
             self.chain_spec.clone(),
+            TracingInspectorConfig::default_geth(),
         )
         .unwrap();
 
@@ -426,6 +439,41 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     pub fn execute_with_trace_and_commit(&self, call: ContractInput) {
         let public_values = self.execute_with_trace(call).unwrap();
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
+    }
+
+    /// Executes the smart contract call and returns the raw traced execution:
+    /// the call output, the gas used, and the full [`CallTraceArena`] recorded by a
+    /// [`TracingInspector`] configured with `config`.
+    ///
+    /// This is the building block for custom public-value commitments that need access to
+    /// the execution trace itself (e.g. reconstructing a `debug_traceCall`-style
+    /// `DefaultFrame` to extract Gas Killer state updates). Unlike [`execute_with_trace`],
+    /// nothing is hashed or discarded here.
+    ///
+    /// [`execute_with_trace`]: ClientExecutor::execute_with_trace
+    pub fn execute_traced(
+        &self,
+        call: &ContractInput,
+        config: TracingInspectorConfig,
+    ) -> eyre::Result<TracedExecution> {
+        let cache_db = CacheDB::new(&self.witness_db);
+        let (tx_output, arena) = P::transact_with_trace(
+            call,
+            cache_db,
+            self.header,
+            U256::ZERO,
+            self.chain_spec.clone(),
+            config,
+        )
+        .unwrap();
+
+        let (output, gas_used) = match tx_output.result {
+            ExecutionResult::Success { output, gas_used, .. } => (output.data().clone(), gas_used),
+            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
+            ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
+        };
+
+        Ok(TracedExecution { output, gas_used, arena })
     }
 
     /// Returns the decoded logs matching the provided `filter`.

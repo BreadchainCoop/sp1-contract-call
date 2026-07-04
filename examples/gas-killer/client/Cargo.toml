@@ -1,0 +1,19 @@
+[package]
+name = "gas-killer-client"
+description = "SP1 guest program proving correct Gas Killer storage updates for a contract call"
+edition = "2021"
+
+[dependencies]
+# workspace
+sp1-cc-client-executor = { path = "../../../crates/client-executor" }
+gas-killer-primitives = { path = "../primitives" }
+
+# alloy
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types.workspace = true
+
+# sp1
+sp1-zkvm.workspace = true
+
+# misc
+bincode = "1.3.3"

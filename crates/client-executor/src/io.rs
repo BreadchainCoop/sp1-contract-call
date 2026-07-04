@@ -106,12 +106,18 @@ pub trait Primitives: NodePrimitives {
 
     /// Execute a contract call with opcode tracing enabled.
     /// Returns both the execution result and the execution trace.
+    ///
+    /// `config` controls what the [`TracingInspector`] records (steps, stack, memory
+    /// snapshots, ...). Use [`TracingInspectorConfig::default_geth`] for the opcode-hash
+    /// use case; enable memory snapshots when the trace must reproduce a
+    /// `debug_traceCall` `DefaultFrame` (e.g. Gas Killer state-update extraction).
     fn transact_with_trace<DB>(
         input: &ContractInput,
         db: DB,
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        config: TracingInspectorConfig,
     ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String>
     where
         DB: Database;
@@ -172,6 +178,7 @@ impl Primitives for EthPrimitives {
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        config: TracingInspectorConfig,
     ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
         let EvmEnv { mut cfg_env, mut block_env, .. } =
             EthEvmConfig::new(chain_spec).evm_env(header).unwrap();
@@ -183,7 +190,7 @@ impl Primitives for EthPrimitives {
         cfg_env.disable_balance_check = true;
         cfg_env.disable_fee_charge = true;
 
-        let inspector = TracingInspector::new(TracingInspectorConfig::default_geth());
+        let inspector = TracingInspector::new(config);
 
         let evm = Context::mainnet()
             .with_db(db)
@@ -267,6 +274,7 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        _config: TracingInspectorConfig,
     ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
         // For Optimism, we currently don't support tracing due to API limitations.
         // Just run the regular transact and return an empty trace.

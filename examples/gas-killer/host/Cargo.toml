@@ -1,0 +1,46 @@
+[package]
+name = "gas-killer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gas-killer-challenger"
+path = "src/main.rs"
+
+[dependencies]
+# workspace
+sp1-cc-host-executor = { path = "../../../crates/host-executor" }
+sp1-cc-client-executor = { path = "../../../crates/client-executor" }
+gas-killer-primitives = { path = "../primitives" }
+
+# alloy
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types = { workspace = true, features = ["eth", "trace"] }
+alloy.workspace = true
+
+# misc
+url.workspace = true
+tokio.workspace = true
+eyre.workspace = true
+bincode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dotenv.workspace = true
+clap = { version = "4.0", features = ["derive"] }
+hex = "0.4"
+
+# sp1
+sp1-sdk.workspace = true
+
+[dev-dependencies]
+alloy-node-bindings.workspace = true
+gas-analyzer-core = { git = "https://github.com/gas-killer/gas-analyzer", rev = "81b1ab9c858206cb7d04fcb9b325a68eaf450eb6" }
+
+[build-dependencies]
+sp1-build.workspace = true
+
+[features]
+default = []
+cuda = ["sp1-sdk/cuda"]

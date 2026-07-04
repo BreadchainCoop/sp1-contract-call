@@ -1,0 +1,21 @@
+[package]
+name = "gas-killer-primitives"
+description = "Shared types and trace processing for the Gas Killer challenger program"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+# workspace
+sp1-cc-client-executor = { path = "../../../crates/client-executor" }
+
+# gas-killer (pinned to the revision used by gas-killer/service)
+gas-analyzer-core = { git = "https://github.com/gas-killer/gas-analyzer", rev = "81b1ab9c858206cb7d04fcb9b325a68eaf450eb6" }
+
+# alloy
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types.workspace = true
+alloy-rpc-types = { workspace = true, features = ["eth", "trace"] }
+
+# misc
+eyre.workspace = true
