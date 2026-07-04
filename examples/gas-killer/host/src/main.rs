@@ -225,6 +225,11 @@ async fn main() -> eyre::Result<()> {
         proof: proof_bytes,
     };
 
+    if let Some(parent) = args.fixture_out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     std::fs::write(&args.fixture_out, serde_json::to_string_pretty(&fixture)?)?;
     println!("saved fixture to {}", args.fixture_out.display());
 
