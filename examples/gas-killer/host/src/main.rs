@@ -1,54 +1,39 @@
-//! Gas Killer challenger host.
+//! Gas Killer challenger host (one-shot).
 //!
-//! Given the (contract, caller, calldata, block) tuple that the Gas Killer aggregate
-//! network signed storage updates for, this binary:
+//! Given the (contract, caller, calldata, block) tuple that the Gas Killer aggregate network
+//! signed storage updates for, this re-executes the call, prints the *correct* storage updates,
+//! and (with `--prove`) generates an on-chain-verifiable SP1 proof, writing a fixture JSON for
+//! the `GasKillerSlasher` Foundry tests.
 //!
-//! 1. fetches the required Ethereum state at the anchor block via RPC,
-//! 2. re-executes the call natively and derives the canonical Gas Killer
-//!    `storageUpdates` bytes (same pipeline as the operators),
-//! 3. runs the challenger guest program in SP1 to (optionally) prove the execution, and
-//! 4. writes a proof fixture JSON consumable by the `GasKillerSlasher` Foundry tests.
-//!
-//! Example (execute only):
 //! ```text
 //! cargo run --release --bin gas-killer-challenger -- \
 //!     --eth-rpc-url https://ethereum-sepolia-rpc.publicnode.com \
-//!     --block 12345678 \
-//!     --contract 0x... --caller 0x... --calldata 0xa9059cbb...
+//!     --block 12345678 --contract 0x... --caller 0x... --calldata 0xa9059cbb... \
+//!     --prove groth16 --fixture-out fixture.json
 //! ```
 //!
-//! Add `--prove groth16 --fixture-out fixture.json` to generate an on-chain-verifiable
-//! proof (requires substantial resources; use `SP1_PROVER=cpu`).
+//! For an automated challenger that watches contracts and slashes fraud on-chain, see the
+//! `gas-killer-watcher` binary.
 
 use std::path::PathBuf;
 
 use alloy::hex;
-use alloy_primitives::{Address, Bytes, U256};
-use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
-use alloy_rpc_types::BlockNumberOrTag;
-use alloy_sol_types::SolValue;
+use alloy_primitives::{Address, Bytes};
 use clap::{Parser, ValueEnum};
-use gas_killer_primitives::{
-    challenger_inspector_config, encoded_state_updates_from_arena, GasKillerPublicValues,
-};
+use gas_killer::challenge::{self, ProofMode};
 use serde::{Deserialize, Serialize};
-use sp1_cc_client_executor::{ClientExecutor, ContractCalldata, ContractInput, Genesis};
-use sp1_cc_host_executor::EvmSketch;
-use sp1_sdk::{include_elf, utils, HashableKey, ProverClient, SP1Stdin};
+use sp1_sdk::utils;
 use url::Url;
-
-/// The challenger guest program ELF.
-const ELF: &[u8] = include_elf!("gas-killer-client");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ProveMode {
     /// Execute only, no proof.
     None,
-    /// Generate a core (STARK) proof — fast sanity check, not on-chain verifiable.
+    /// Core (STARK) proof — fast sanity check, not on-chain verifiable.
     Core,
-    /// Generate a Groth16 proof — on-chain verifiable via SP1VerifierGroth16.
+    /// Groth16 proof — on-chain verifiable via SP1VerifierGroth16.
     Groth16,
-    /// Generate a PLONK proof — on-chain verifiable via SP1VerifierPlonk.
+    /// PLONK proof — on-chain verifiable via SP1VerifierPlonk.
     Plonk,
 }
 
@@ -63,9 +48,7 @@ struct GasKillerProofFixture {
     caller_address: String,
     contract_address: String,
     contract_calldata: String,
-    contract_output: String,
     storage_updates: String,
-    opcode_hash: String,
     vkey: String,
     public_values: String,
     proof: String,
@@ -78,8 +61,7 @@ struct Args {
     #[clap(long, env = "ETH_RPC_URL")]
     eth_rpc_url: Url,
 
-    /// The block the execution is anchored to. The call executes against the state
-    /// AFTER this block (its state root), and `anchorHash` is this block's hash.
+    /// The block the execution is anchored to (state AFTER this block; anchorHash = its hash).
     #[clap(long)]
     block: u64,
 
@@ -99,12 +81,7 @@ struct Args {
     #[clap(long, value_enum, default_value = "none")]
     prove: ProveMode,
 
-    /// Use a dev chain config (all forks active from genesis) instead of a named network.
-    ///
-    /// Local dev chains (anvil) have tiny block numbers but present-day timestamps, which is
-    /// inconsistent with a real network's block-gated merge, so the guest's header validation
-    /// rejects them. This uses an anvil-style chainspec (all forks active at block 0) built for
-    /// the detected chain id, matching how anvil produces blocks.
+    /// Use a dev chain config (all forks active from genesis) for local anvil chains.
     #[clap(long)]
     dev_genesis: bool,
 
@@ -113,157 +90,65 @@ struct Args {
     fixture_out: PathBuf,
 }
 
-/// An anvil-style dev chain config: every fork active from genesis, post-merge from block 0.
-fn dev_chain_config(chain_id: u64) -> alloy_genesis::ChainConfig {
-    alloy_genesis::ChainConfig {
-        chain_id,
-        homestead_block: Some(0),
-        dao_fork_block: Some(0),
-        dao_fork_support: true,
-        eip150_block: Some(0),
-        eip155_block: Some(0),
-        eip158_block: Some(0),
-        byzantium_block: Some(0),
-        constantinople_block: Some(0),
-        petersburg_block: Some(0),
-        istanbul_block: Some(0),
-        muir_glacier_block: Some(0),
-        berlin_block: Some(0),
-        london_block: Some(0),
-        arrow_glacier_block: Some(0),
-        gray_glacier_block: Some(0),
-        merge_netsplit_block: Some(0),
-        shanghai_time: Some(0),
-        cancun_time: Some(0),
-        prague_time: Some(0),
-        terminal_total_difficulty: Some(U256::ZERO),
-        terminal_total_difficulty_passed: true,
-        ..Default::default()
-    }
-}
-
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     dotenv::dotenv().ok();
     utils::setup_logger();
 
     let args = Args::parse();
-    let calldata =
-        Bytes::from(hex::decode(args.calldata.trim_start_matches("0x")).map_err(|e| {
-            eyre::eyre!("invalid --calldata hex: {e}")
-        })?);
+    let calldata = Bytes::from(
+        hex::decode(args.calldata.trim_start_matches("0x"))
+            .map_err(|e| eyre::eyre!("invalid --calldata hex: {e}"))?,
+    );
 
-    // Detect the chain so the guest validates headers against the right chain spec.
-    let provider = RootProvider::<AnyNetwork>::new_http(args.eth_rpc_url.clone());
-    let chain_id = provider.get_chain_id().await?;
-    let genesis = if args.dev_genesis {
-        Genesis::Custom(dev_chain_config(chain_id))
-    } else {
-        match chain_id {
-            1 => Genesis::Mainnet,
-            11155111 => Genesis::Sepolia,
-            id => eyre::bail!("unsupported chain id {id}; add its Genesis mapping or pass --dev-genesis"),
+    let (genesis, chain_id) = challenge::resolve_genesis(&args.eth_rpc_url, args.dev_genesis).await?;
+
+    // Re-execute the call and derive the correct storage updates.
+    let exec = challenge::recompute(
+        &args.eth_rpc_url,
+        genesis,
+        args.block,
+        args.contract,
+        args.caller,
+        calldata.clone(),
+    )
+    .await?;
+    println!("anchor block {} hash {}", exec.block, exec.anchor_hash);
+    println!(
+        "storage updates ({} bytes): 0x{}",
+        exec.storage_updates.len(),
+        hex::encode(&exec.storage_updates)
+    );
+
+    let mode = match args.prove {
+        ProveMode::None => {
+            println!("--prove not set; done.");
+            return Ok(());
         }
+        ProveMode::Core => ProofMode::Core,
+        ProveMode::Groth16 => ProofMode::Groth16,
+        ProveMode::Plonk => ProofMode::Plonk,
     };
 
-    // Prepare the host executor at the anchor block.
-    let sketch = EvmSketch::builder()
-        .at_block(BlockNumberOrTag::Number(args.block))
-        .with_genesis(genesis)
-        .el_rpc_url(args.eth_rpc_url.clone())
-        .build()
-        .await?;
-
-    let anchor = sketch.anchor.resolve();
-    println!("anchor block {} hash {}", args.block, anchor.hash);
-
-    let call = ContractInput {
-        contract_address: args.contract,
-        caller_address: args.caller,
-        calldata: ContractCalldata::Call(calldata.clone()),
-    };
-
-    // Execute the call on the host so the rpc_db records every accessed account/slot.
-    let output = sketch.call_raw(&call).await?;
-    println!("call output: 0x{}", hex::encode(&output));
-
-    // Finalize: fetch merkle proofs for all touched state.
-    let input = sketch.finalize().await?;
-
-    // Native pre-check: run the exact guest pipeline natively and print the storage
-    // updates the proof will commit. This catches unsupported-opcode failures early.
-    {
-        let executor = ClientExecutor::eth(&input)?;
-        let traced = executor.execute_traced(&call, challenger_inspector_config())?;
-        let (storage_updates, skipped) = encoded_state_updates_from_arena(
-            &traced.arena,
-            traced.gas_used,
-            traced.output.clone(),
-        )?;
-        if !skipped.is_empty() {
-            eyre::bail!("execution used unsupported opcodes: {skipped:?}");
-        }
-        println!("storage updates ({} bytes): 0x{}", storage_updates.len(), {
-            hex::encode(&storage_updates)
-        });
-    }
-
-    // Feed the sketch + call into the guest.
-    let input_bytes = bincode::serialize(&input)?;
-    let mut stdin = SP1Stdin::new();
-    stdin.write(&input_bytes);
-    stdin.write(&args.contract);
-    stdin.write(&args.caller);
-    stdin.write(&calldata.to_vec());
-
-    let client = ProverClient::from_env();
-
-    // Execute the guest without proving to get the committed public values + cycles.
-    let (execute_values, report) = client.execute(ELF, &stdin).run().unwrap();
-    println!("executed program with {} cycles", report.total_instruction_count());
-
-    let public_vals = GasKillerPublicValues::abi_decode(execute_values.as_slice())?;
-    assert_eq!(public_vals.anchorHash, anchor.hash, "anchor hash mismatch");
-    assert_eq!(public_vals.id, U256::from(args.block), "anchor id mismatch");
-
-    if args.prove == ProveMode::None {
-        println!("--prove not set; done.");
-        return Ok(());
-    }
-
-    // Generate the proof.
-    let (pk, vk) = client.setup(ELF);
-    let proof = match args.prove {
-        ProveMode::Core => client.prove(&pk, &stdin).run().unwrap(),
-        ProveMode::Groth16 => client.prove(&pk, &stdin).groth16().run().unwrap(),
-        ProveMode::Plonk => client.prove(&pk, &stdin).plonk().run().unwrap(),
-        ProveMode::None => unreachable!(),
-    };
-    println!("generated {:?} proof", args.prove);
-
-    client.verify(&proof, &vk).expect("proof verification failed");
-    println!("proof verified");
-
-    let proof_bytes = match args.prove {
-        // Core proofs have no compact on-chain encoding.
-        ProveMode::Core => String::new(),
-        _ => format!("0x{}", hex::encode(proof.bytes())),
-    };
+    let proven = challenge::prove(&exec, mode)?;
+    println!("generated {:?} proof; verified", args.prove);
 
     let fixture = GasKillerProofFixture {
         chain_id,
-        block_number: args.block,
-        anchor_hash: format!("{}", public_vals.anchorHash),
-        chain_config_hash: format!("{}", public_vals.chainConfigHash),
-        caller_address: format!("{}", public_vals.callerAddress),
-        contract_address: format!("{}", public_vals.contractAddress),
-        contract_calldata: format!("0x{}", hex::encode(&public_vals.contractCalldata)),
-        contract_output: format!("0x{}", hex::encode(&public_vals.contractOutput)),
-        storage_updates: format!("0x{}", hex::encode(&public_vals.storageUpdates)),
-        opcode_hash: format!("{}", public_vals.opcodeHash),
-        vkey: vk.bytes32(),
-        public_values: format!("0x{}", hex::encode(proof.public_values.as_slice())),
-        proof: proof_bytes,
+        block_number: exec.block,
+        anchor_hash: format!("{}", exec.anchor_hash),
+        chain_config_hash: format!("{}", proven.chain_config_hash),
+        caller_address: format!("{}", args.caller),
+        contract_address: format!("{}", args.contract),
+        contract_calldata: format!("0x{}", hex::encode(&calldata)),
+        storage_updates: format!("0x{}", hex::encode(&exec.storage_updates)),
+        vkey: proven.vkey_bytes32,
+        public_values: format!("0x{}", hex::encode(&proven.public_values)),
+        proof: if proven.proof.is_empty() {
+            String::new()
+        } else {
+            format!("0x{}", hex::encode(&proven.proof))
+        },
     };
 
     if let Some(parent) = args.fixture_out.parent() {

@@ -3400,11 +3400,13 @@ name = "gas-killer"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-contract",
  "alloy-genesis",
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types",
+ "alloy-sol-macro",
  "alloy-sol-types",
  "bincode",
  "clap",
@@ -3415,11 +3417,14 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sp1-build",
  "sp1-cc-client-executor",
  "sp1-cc-host-executor",
  "sp1-sdk",
  "tokio",
+ "toml 0.8.23",
+ "tracing",
  "url",
 ]
 

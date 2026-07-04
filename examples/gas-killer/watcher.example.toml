@@ -1,0 +1,17 @@
+# Gas Killer challenger watcher config.
+#
+# The challenger key may be set here or via the CHALLENGER_KEY env var. It must hold gas on
+# every target chain.
+challenger_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+poll_interval_secs = 12
+confirmations = 2
+prove_mode = "groth16"   # groth16 | plonk | core
+dev_genesis = false      # true for local anvil chains
+dry_run = false          # true = detect + log fraud only, never prove/slash
+
+[[targets]]
+name = "array-summation-sepolia"
+rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+contract = "0x0000000000000000000000000000000000000000"  # the GasKillerSDK contract to watch
+slasher  = "0x0000000000000000000000000000000000000000"  # the deployed GasKillerSlasher
+# start_block = 12345678   # omit to start from the chain head

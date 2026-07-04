@@ -3,9 +3,17 @@ name = "gas-killer"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "gas_killer"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gas-killer-challenger"
 path = "src/main.rs"
+
+[[bin]]
+name = "gas-killer-watcher"
+path = "src/watcher.rs"
 
 [dependencies]
 # workspace
@@ -16,21 +24,26 @@ gas-killer-primitives = { path = "../primitives" }
 # alloy
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-sol-types.workspace = true
+alloy-sol-macro.workspace = true
 alloy-provider.workspace = true
+alloy-contract.workspace = true
 alloy-rpc-types = { workspace = true, features = ["eth", "trace"] }
-alloy.workspace = true
+alloy = { workspace = true, features = ["signer-local", "network", "providers", "contract", "rpc-types"] }
 alloy-genesis = "1.1"
 
 # misc
 url.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 eyre.workspace = true
 bincode.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+toml = "0.8"
 dotenv.workspace = true
 clap = { version = "4.0", features = ["derive"] }
 hex = "0.4"
+sha2 = "0.10"
+tracing.workspace = true
 
 # sp1
 sp1-sdk.workspace = true
