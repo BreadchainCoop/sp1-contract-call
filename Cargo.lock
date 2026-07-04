@@ -3400,6 +3400,7 @@ name = "gas-killer"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-genesis",
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",

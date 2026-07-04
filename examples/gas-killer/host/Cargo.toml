@@ -19,6 +19,7 @@ alloy-sol-types.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types = { workspace = true, features = ["eth", "trace"] }
 alloy.workspace = true
+alloy-genesis = "1.1"
 
 # misc
 url.workspace = true

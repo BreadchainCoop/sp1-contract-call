@@ -99,9 +99,47 @@ struct Args {
     #[clap(long, value_enum, default_value = "none")]
     prove: ProveMode,
 
+    /// Use a dev chain config (all forks active from genesis) instead of a named network.
+    ///
+    /// Local dev chains (anvil) have tiny block numbers but present-day timestamps, which is
+    /// inconsistent with a real network's block-gated merge, so the guest's header validation
+    /// rejects them. This uses an anvil-style chainspec (all forks active at block 0) built for
+    /// the detected chain id, matching how anvil produces blocks.
+    #[clap(long)]
+    dev_genesis: bool,
+
     /// Where to write the proof fixture JSON.
     #[clap(long, default_value = "gas-killer-fixture.json")]
     fixture_out: PathBuf,
+}
+
+/// An anvil-style dev chain config: every fork active from genesis, post-merge from block 0.
+fn dev_chain_config(chain_id: u64) -> alloy_genesis::ChainConfig {
+    alloy_genesis::ChainConfig {
+        chain_id,
+        homestead_block: Some(0),
+        dao_fork_block: Some(0),
+        dao_fork_support: true,
+        eip150_block: Some(0),
+        eip155_block: Some(0),
+        eip158_block: Some(0),
+        byzantium_block: Some(0),
+        constantinople_block: Some(0),
+        petersburg_block: Some(0),
+        istanbul_block: Some(0),
+        muir_glacier_block: Some(0),
+        berlin_block: Some(0),
+        london_block: Some(0),
+        arrow_glacier_block: Some(0),
+        gray_glacier_block: Some(0),
+        merge_netsplit_block: Some(0),
+        shanghai_time: Some(0),
+        cancun_time: Some(0),
+        prague_time: Some(0),
+        terminal_total_difficulty: Some(U256::ZERO),
+        terminal_total_difficulty_passed: true,
+        ..Default::default()
+    }
 }
 
 #[tokio::main]
@@ -118,11 +156,14 @@ async fn main() -> eyre::Result<()> {
     // Detect the chain so the guest validates headers against the right chain spec.
     let provider = RootProvider::<AnyNetwork>::new_http(args.eth_rpc_url.clone());
     let chain_id = provider.get_chain_id().await?;
-    let genesis = match chain_id {
-        1 => Genesis::Mainnet,
-        11155111 => Genesis::Sepolia,
-        31337 => Genesis::Mainnet, // Anvil forking mainnet; adjust if forking another chain.
-        id => eyre::bail!("unsupported chain id {id}; add its Genesis mapping"),
+    let genesis = if args.dev_genesis {
+        Genesis::Custom(dev_chain_config(chain_id))
+    } else {
+        match chain_id {
+            1 => Genesis::Mainnet,
+            11155111 => Genesis::Sepolia,
+            id => eyre::bail!("unsupported chain id {id}; add its Genesis mapping or pass --dev-genesis"),
+        }
     };
 
     // Prepare the host executor at the anchor block.
