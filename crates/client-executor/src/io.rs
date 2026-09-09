@@ -21,7 +21,7 @@ use reth_primitives::{EthPrimitives, Header, NodePrimitives, SealedHeader};
 use revm::{
     context::{
         result::{HaltReason, ResultAndState},
-        TxEnv,
+        BlockEnv, CfgEnv, TxEnv,
     },
     inspector::NoOpInspector,
     state::Bytecode,
@@ -36,7 +36,7 @@ use rsp_primitives::genesis::Genesis;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{Anchor, ContractInput, EnvOverrides};
+use crate::{Anchor, ContractInput, EnvOverrides, ResolvedGasLimits};
 
 /// Information about how the contract executions accessed state, which is needed to execute the
 /// contract in SP1.
@@ -99,10 +99,10 @@ pub trait Primitives: NodePrimitives {
 
     /// Execute a contract call.
     ///
-    /// `overrides` adjusts the simulated environment (gas limits) and MUST be
-    /// bit-identical between the host that built the sketch and the guest that
-    /// proves the execution — see [`EnvOverrides`]. Pass
-    /// `EnvOverrides::default()` for the historical header-derived behaviour.
+    /// `overrides` adjusts the simulated gas limits and must be bit-identical
+    /// between the host that builds the sketch and the guest that proves the
+    /// execution; see [`EnvOverrides`]. `EnvOverrides::default()` follows the
+    /// header.
     fn transact<DB>(
         input: &ContractInput,
         db: DB,
@@ -128,6 +128,35 @@ pub trait Primitives: NodePrimitives {
         DB: Database;
 
     fn active_fork_name(chain_spec: &Self::ChainSpec, header: &Header) -> String;
+}
+
+/// Writes the gas limits an execution must run under into revm's config and
+/// block environments, and returns them so the caller can put the transaction
+/// limit on the `TxEnv` it passes to `Evm::transact`.
+///
+/// The transaction limit cannot be set through the context: `Evm::transact`
+/// replaces the context's transaction environment with the one converted from
+/// the [`ContractInput`], whose `TxEnv::default()` carries revm's 2^24 builder
+/// default. It must ride on the `TxEnv` handed to `transact` itself.
+///
+/// An overridden transaction limit also lifts revm's EIP-7825 per-transaction
+/// cap, which would otherwise clamp it from Osaka onwards and make the same
+/// execution diverge across the hardfork boundary. The cap is raised only to
+/// the override, so executions without one stay subject to the real cap.
+fn apply_gas_limits<Spec>(
+    cfg_env: &mut CfgEnv<Spec>,
+    block_env: &mut BlockEnv,
+    header: &Header,
+    overrides: EnvOverrides,
+) -> ResolvedGasLimits {
+    let limits = overrides.resolve(header.gas_limit);
+
+    block_env.gas_limit = limits.block;
+    if overrides.tx_gas_limit.is_some() {
+        cfg_env.tx_gas_limit_cap = Some(limits.tx);
+    }
+
+    limits
 }
 
 impl Primitives for EthPrimitives {
@@ -164,24 +193,10 @@ impl Primitives for EthPrimitives {
         cfg_env.disable_balance_check = true;
         cfg_env.disable_fee_charge = true;
 
-        let tx_gas_limit = overrides.tx_gas_limit.unwrap_or(header.gas_limit);
-        if let Some(block_gas_limit) = overrides.block_gas_limit {
-            block_env.gas_limit = block_gas_limit;
-        }
-        if overrides.tx_gas_limit.is_some() {
-            // revm applies the EIP-7825 cap (2^24) from Osaka on; an overridden
-            // tx gas limit must not be silently clamped by it, or the same
-            // execution would diverge across the hardfork boundary.
-            cfg_env.tx_gas_limit_cap = Some(tx_gas_limit);
-        }
+        let limits = apply_gas_limits(&mut cfg_env, &mut block_env, header, overrides);
 
-        // The gas limit must be set on the TxEnv actually passed to
-        // `transact` — `Evm::transact` replaces the context's tx env with the
-        // converted input, so a `modify_tx_chained` assignment never survives.
-        // (`TxEnv::default()` carries revm's 2^24 builder default, which would
-        // silently cap every execution otherwise.)
         let mut tx_env: TxEnv = input.into_tx_env();
-        tx_env.gas_limit = tx_gas_limit;
+        tx_env.gas_limit = limits.tx;
 
         let evm = Context::mainnet()
             .with_db(db)
@@ -212,22 +227,12 @@ impl Primitives for EthPrimitives {
         cfg_env.disable_balance_check = true;
         cfg_env.disable_fee_charge = true;
 
-        let tx_gas_limit = overrides.tx_gas_limit.unwrap_or(header.gas_limit);
-        if let Some(block_gas_limit) = overrides.block_gas_limit {
-            block_env.gas_limit = block_gas_limit;
-        }
-        if overrides.tx_gas_limit.is_some() {
-            // See `transact`: an overridden tx gas limit must escape the
-            // EIP-7825 cap revm applies from Osaka on.
-            cfg_env.tx_gas_limit_cap = Some(tx_gas_limit);
-        }
+        let limits = apply_gas_limits(&mut cfg_env, &mut block_env, header, overrides);
 
         let inspector = TracingInspector::new(TracingInspectorConfig::default_geth());
 
-        // See `transact`: the gas limit must ride on the TxEnv passed to
-        // `Evm::transact`, not on the context.
         let mut tx_env: TxEnv = input.into_tx_env();
-        tx_env.gas_limit = tx_gas_limit;
+        tx_env.gas_limit = limits.tx;
 
         let evm = Context::mainnet()
             .with_db(db)
@@ -289,18 +294,10 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         cfg_env.disable_balance_check = true;
         cfg_env.disable_fee_charge = true;
 
-        let tx_gas_limit = overrides.tx_gas_limit.unwrap_or(header.gas_limit);
-        if let Some(block_gas_limit) = overrides.block_gas_limit {
-            block_env.gas_limit = block_gas_limit;
-        }
-        if overrides.tx_gas_limit.is_some() {
-            cfg_env.tx_gas_limit_cap = Some(tx_gas_limit);
-        }
+        let limits = apply_gas_limits(&mut cfg_env, &mut block_env, header, overrides);
 
-        // See the Ethereum `transact`: the gas limit must ride on the tx env
-        // passed to `Evm::transact`, not on the context.
         let mut tx_env: op_revm::OpTransaction<TxEnv> = input.into_tx_env();
-        tx_env.base.gas_limit = tx_gas_limit;
+        tx_env.base.gas_limit = limits.tx;
 
         let evm = op_revm::OpContext::op()
             .with_db(db)
@@ -395,22 +392,20 @@ mod tests {
             .expect("transact must not error at the EVM-construction level")
     }
 
-    /// Without overrides the guest executes at the header's gas limit — the
-    /// 40M-gas burner MUST halt out-of-gas. This is the historical behaviour
-    /// and the exact hazard for unbounded Gas Killer executions: an honest
-    /// heavy execution re-run in the guest would diverge and falsely slash.
+    /// Without overrides an execution gets exactly the header's gas limit, so
+    /// the 40M-gas burner halts out of gas at 30M. The precise figure is the
+    /// point of the assertion: revm's `TxEnv` default caps a transaction at
+    /// 2^24 gas unless the limit is set on the env handed to `Evm::transact`,
+    /// and a silent cap there would make heavy honest executions diverge
+    /// between host and guest.
     #[test]
     fn burner_halts_out_of_gas_at_header_limit() {
         let output = burner_call_result(crate::EnvOverrides::default());
         match output.result {
             ExecutionResult::Halt { reason: HaltReason::OutOfGas(_), gas_used } => {
-                // The full header limit must be available — not revm's 2^24
-                // TxEnv builder default, which the old `modify_tx_chained`
-                // (dead code: `Evm::transact` replaces the context tx env)
-                // silently left in place.
                 assert_eq!(
                     gas_used, 30_000_000,
-                    "execution must OOG at the header gas limit, not at another cap"
+                    "execution must run out of gas at the header gas limit, not at another cap"
                 );
             }
             other => panic!("expected OutOfGas halt at the 30M header limit, got {other:?}"),
@@ -439,10 +434,46 @@ mod tests {
         }
     }
 
-    /// The chainConfigHash must bind the overrides: legacy hash for
-    /// no-overrides (bit-compatible with existing proofs), a distinct
-    /// [`ChainConfigWithEnvOverrides`] hash otherwise, both round-tripping
-    /// through their verifiers.
+    /// A transaction-only override above the header limit must still execute:
+    /// revm rejects a transaction whose gas limit exceeds the block's, so the
+    /// resolved block limit has to rise with it.
+    #[test]
+    fn burner_succeeds_with_tx_only_override() {
+        let output = burner_call_result(crate::EnvOverrides {
+            block_gas_limit: None,
+            tx_gas_limit: Some(1 << 40),
+        });
+        match output.result {
+            ExecutionResult::Success { gas_used, .. } => {
+                assert!(
+                    gas_used > 30_000_000,
+                    "burner must consume more than the header gas limit, used {gas_used}"
+                );
+            }
+            other => panic!("expected success under a tx-only override, got {other:?}"),
+        }
+    }
+
+    /// The hash must commit to the limits the EVM actually ran with, including
+    /// the block limit implicitly raised to carry a larger transaction limit.
+    #[test]
+    fn tx_only_override_binds_the_raised_block_limit() {
+        let overrides = crate::EnvOverrides { block_gas_limit: None, tx_gas_limit: Some(1 << 40) };
+        let limits = overrides.resolve(30_000_000);
+
+        assert_eq!(limits.tx, 1 << 40);
+        assert_eq!(limits.block, 1 << 40, "block limit must cover the tx limit");
+        assert_eq!(
+            overrides.resolve(30_000_000),
+            crate::EnvOverrides::gas_limits(1 << 40).resolve(30_000_000),
+            "both spellings of the same profile must resolve identically"
+        );
+    }
+
+    /// The `chainConfigHash` binds the overrides: the plain [`ChainConfig`]
+    /// hash when none are set, a distinct [`ChainConfigWithEnvOverrides`] hash
+    /// otherwise, each round-tripping through its verifier and rejecting the
+    /// other.
     #[test]
     fn chain_config_hash_binds_overrides() {
         use crate::{verifiy_chain_config_eth, verify_chain_config_eth_with_overrides};

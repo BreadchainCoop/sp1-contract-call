@@ -79,15 +79,9 @@ where
         let cache_db = CacheDB::new(&self.rpc_db);
         let chain_spec = PT::build_spec(&self.genesis)?;
         let input = ContractInput::new_call(contract_address, caller_address, calldata);
-        let output = PT::transact(
-            &input,
-            cache_db,
-            self.anchor.header(),
-            U256::ZERO,
-            chain_spec,
-            overrides,
-        )
-        .map_err(|err| eyre!(err))?;
+        let output =
+            PT::transact(&input, cache_db, self.anchor.header(), U256::ZERO, chain_spec, overrides)
+                .map_err(|err| eyre!(err))?;
 
         let output_bytes = match output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),
@@ -168,15 +162,9 @@ where
     ) -> eyre::Result<Bytes> {
         let cache_db = CacheDB::new(&self.rpc_db);
         let chain_spec = PT::build_spec(&self.genesis)?;
-        let output = PT::transact(
-            input,
-            cache_db,
-            self.anchor.header(),
-            U256::ZERO,
-            chain_spec,
-            overrides,
-        )
-        .map_err(|err| eyre!(err))?;
+        let output =
+            PT::transact(input, cache_db, self.anchor.header(), U256::ZERO, chain_spec, overrides)
+                .map_err(|err| eyre!(err))?;
 
         let output_bytes = match output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),
