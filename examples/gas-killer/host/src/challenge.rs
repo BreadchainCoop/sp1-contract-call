@@ -12,7 +12,7 @@ use gas_killer_primitives::{
     challenger_inspector_config, encoded_state_updates_from_arena, GasKillerPublicValues,
 };
 use sp1_cc_client_executor::{
-    io::EvmSketchInput, ClientExecutor, ContractCalldata, ContractInput, Genesis,
+    io::EvmSketchInput, ClientExecutor, ContractCalldata, ContractInput, EnvOverrides, Genesis,
 };
 use sp1_cc_host_executor::EvmSketch;
 use sp1_sdk::{include_elf, HashableKey, ProverClient, SP1Stdin};
@@ -119,7 +119,8 @@ pub async fn recompute(
 
     // Derive the canonical storage updates via the exact guest pipeline (native).
     let executor = ClientExecutor::eth(&input)?;
-    let traced = executor.execute_traced(&call, challenger_inspector_config())?;
+    let traced =
+        executor.execute_traced(&call, EnvOverrides::default(), challenger_inspector_config())?;
     let (storage_updates, skipped) =
         encoded_state_updates_from_arena(&traced.arena, traced.gas_used, traced.output.clone())?;
     if !skipped.is_empty() {

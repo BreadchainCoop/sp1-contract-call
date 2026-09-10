@@ -27,7 +27,9 @@ use alloy_rpc_types::{
     BlockNumberOrTag, TransactionInput, TransactionRequest,
 };
 use gas_killer_primitives::{challenger_inspector_config, encoded_state_updates_from_arena};
-use sp1_cc_client_executor::{ClientExecutor, ContractCalldata, ContractInput, Genesis};
+use sp1_cc_client_executor::{
+    ClientExecutor, ContractCalldata, ContractInput, EnvOverrides, Genesis,
+};
 use sp1_cc_host_executor::EvmSketch;
 use url::Url;
 
@@ -115,7 +117,7 @@ async fn challenger_storage_updates(calldata: Bytes) -> Bytes {
 
     let executor = ClientExecutor::eth(&input).expect("client executor failed");
     let traced = executor
-        .execute_traced(&call, challenger_inspector_config())
+        .execute_traced(&call, EnvOverrides::default(), challenger_inspector_config())
         .expect("traced execution failed");
     let (storage_updates, skipped) =
         encoded_state_updates_from_arena(&traced.arena, traced.gas_used, traced.output.clone())

@@ -16,6 +16,7 @@ use gas_killer_primitives::{
 };
 use sp1_cc_client_executor::{
     compute_opcode_hash, io::EvmSketchInput, ClientExecutor, ContractCalldata, ContractInput,
+    EnvOverrides,
 };
 
 pub fn main() {
@@ -40,7 +41,9 @@ pub fn main() {
     };
 
     // Execute with a trace that can reproduce a production `debug_traceCall` frame.
-    let traced = executor.execute_traced(&call, challenger_inspector_config()).unwrap();
+    let traced = executor
+        .execute_traced(&call, EnvOverrides::default(), challenger_inspector_config())
+        .unwrap();
 
     // Derive the canonical Gas Killer storage updates from the trace. This is the same
     // pipeline (same code) an honest operator runs when signing.

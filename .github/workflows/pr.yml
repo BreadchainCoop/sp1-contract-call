@@ -12,6 +12,10 @@ concurrency:
 jobs:
   examples:
     name: Test ${{ matrix.example }} example
+    # Requires Succinct's RunsOn self-hosted runners and their RPC secrets,
+    # neither of which exists on a fork, so the job would queue until it times
+    # out. Hosted-runner coverage of the library crates lives in lib-tests.yml.
+    if: github.repository == 'succinctlabs/sp1-contract-call'
     runs-on:
       [
         runs-on,
@@ -65,6 +69,10 @@ jobs:
 
   test-e2e:
     name: E2E tests
+    # Requires Succinct's RunsOn self-hosted runners and their RPC secrets,
+    # neither of which exists on a fork, so the job would queue until it times
+    # out. Hosted-runner coverage of the library crates lives in lib-tests.yml.
+    if: github.repository == 'succinctlabs/sp1-contract-call'
     runs-on:
       ["runs-on", "runner=32cpu-linux-x64", "run-id=${{ github.run_id }}"]
     env:
