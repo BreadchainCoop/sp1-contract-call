@@ -12,7 +12,7 @@ sp1_zkvm::entrypoint!(main);
 use alloy_primitives::{Address, Bytes};
 use alloy_sol_types::SolValue;
 use gas_killer_primitives::{
-    challenger_inspector_config, encoded_state_updates_from_arena, GasKillerPublicValues,
+    challenger_inspector_config, encoded_state_updates_from_execution, GasKillerPublicValues,
 };
 use sp1_cc_client_executor::{
     compute_opcode_hash, io::EvmSketchInput, ClientExecutor, ContractCalldata, ContractInput,
@@ -47,9 +47,14 @@ pub fn main() {
 
     // Derive the canonical Gas Killer storage updates from the trace. This is the same
     // pipeline (same code) an honest operator runs when signing.
-    let (storage_updates, skipped) =
-        encoded_state_updates_from_arena(&traced.arena, traced.gas_used, traced.output.clone())
-            .unwrap();
+    let (storage_updates, skipped) = encoded_state_updates_from_execution(
+        contract_address,
+        &traced.state,
+        &traced.arena,
+        traced.gas_used,
+        traced.output.clone(),
+    )
+    .unwrap();
     assert!(skipped.is_empty(), "execution used unsupported opcodes: {skipped:?}");
 
     let opcode_hash = compute_opcode_hash(&traced.arena);

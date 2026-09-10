@@ -14,6 +14,10 @@ use std::collections::BTreeMap;
 use alloy_primitives::B256;
 use alloy_rpc_types::trace::geth::{AccountState, CallConfig, CallFrame, DiffMode};
 use revm::state::EvmState;
+
+/// Re-exported so a caller can name the journal type these adapters consume without
+/// taking a direct `revm` dependency at a version that has to match this crate's.
+pub use revm::state::EvmState as ExecutionState;
 use revm_inspectors::tracing::GethTraceBuilder;
 
 use crate::inspector::CallTraceArena;

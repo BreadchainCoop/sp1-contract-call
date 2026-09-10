@@ -11,7 +11,7 @@
 //! - production: anvil forked at the anchor block serves `debug_traceCall`, the
 //!   trace is processed with the same `gas-analyzer-core` functions the service uses
 //! - challenger: `EvmSketch` witnesses the state, and the guest pipeline
-//!   (`execute_traced` + `encoded_state_updates_from_arena`) derives the updates
+//!   (`execute_traced` + `encoded_state_updates_from_execution`) derives the updates
 //!
 //! Requires network access and the `anvil` binary:
 //! ```text
@@ -26,7 +26,7 @@ use alloy_rpc_types::{
     trace::geth::{DefaultFrame, GethDebugTracingCallOptions, GethDefaultTracingOptions},
     BlockNumberOrTag, TransactionInput, TransactionRequest,
 };
-use gas_killer_primitives::{challenger_inspector_config, encoded_state_updates_from_arena};
+use gas_killer_primitives::{challenger_inspector_config, encoded_state_updates_from_execution};
 use sp1_cc_client_executor::{
     ClientExecutor, ContractCalldata, ContractInput, EnvOverrides, Genesis,
 };
@@ -119,9 +119,14 @@ async fn challenger_storage_updates(calldata: Bytes) -> Bytes {
     let traced = executor
         .execute_traced(&call, EnvOverrides::default(), challenger_inspector_config())
         .expect("traced execution failed");
-    let (storage_updates, skipped) =
-        encoded_state_updates_from_arena(&traced.arena, traced.gas_used, traced.output.clone())
-            .expect("state update extraction failed");
+    let (storage_updates, skipped) = encoded_state_updates_from_execution(
+        call.contract_address,
+        &traced.state,
+        &traced.arena,
+        traced.gas_used,
+        traced.output.clone(),
+    )
+    .expect("state update extraction failed");
     assert!(skipped.is_empty(), "challenger pipeline skipped opcodes: {skipped:?}");
 
     storage_updates

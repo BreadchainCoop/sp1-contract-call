@@ -3383,7 +3383,7 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 [[package]]
 name = "gas-analyzer-core"
 version = "0.1.0"
-source = "git+https://github.com/gas-killer/gas-analyzer?rev=81b1ab9c858206cb7d04fcb9b325a68eaf450eb6#81b1ab9c858206cb7d04fcb9b325a68eaf450eb6"
+source = "git+https://github.com/gas-killer/gas-analyzer?rev=3cbd54f802da8c6a25572e42145aedd51cb9a95e#3cbd54f802da8c6a25572e42145aedd51cb9a95e"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types",

@@ -7,25 +7,43 @@
 //!
 //! For the comparison to be sound, the storage-update bytes committed here must be
 //! byte-for-byte identical to what an honest operator would sign for the same call.
-//! Operators derive them with `gas-analyzer`:
+//! Which bytes those are depends on the fleet's `STATE_ENCODING`, and the deployed
+//! fleet runs `prestate-net`:
 //!
 //! ```text
-//! debug_traceCall(tx, block, {enableMemory: true, disableStorage: true})
-//!     -> gas_analyzer_core::trace::compute_state_updates(DefaultFrame)
-//!     -> gas_analyzer_core::encoding::encode_state_updates_to_abi
+//! debug_traceCall(prestateTracer{diffMode}) + debug_traceCall(callTracer{withLog})
+//!     -> classify_prestate_eligibility
+//!        Eligible -> build_state_updates_from_prestate
+//!        Fallback -> compute_state_updates_canonical(DefaultFrame)
+//!     -> encode_state_updates_to_abi
 //! ```
 //!
-//! This crate reproduces that exact pipeline from an in-zkVM execution trace: the
-//! recorded [`CallTraceArena`] is converted to a Geth-style `DefaultFrame` with the same
-//! tracer options production uses, and then fed through the *same* `gas-analyzer-core`
-//! functions (pinned to the revision the Gas Killer service uses).
+//! This crate reproduces that from a single in-zkVM execution. The recorded journal
+//! becomes the `diffMode` diff and the [`CallTraceArena`] becomes the `callTracer`
+//! frame, then the *same* `gas-analyzer-core` functions decide and encode, pinned to
+//! the revision the Gas Killer service uses.
+//!
+//! The net form is not a cheaper route to the Legacy bytes: it carries one store per
+//! *changed* slot, so repeated writes collapse and a slot written back to its original
+//! value produces none. Reproducing the wrong encoding would make every honest operator
+//! look fraudulent, so the encoding is part of what has to match, not an implementation
+//! detail. `STATE_ENCODING` is not yet bound into the commitment
+//! (gas-killer/solidity-sdk#83), so this is hardcoded to the deployed value.
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Address, Bytes};
 use alloy_rpc_types::trace::geth::GethDefaultTracingOptions;
 use alloy_sol_types::sol;
-use sp1_cc_client_executor::{CallTraceArena, GethTraceBuilder, TracingInspectorConfig};
+use sp1_cc_client_executor::{
+    prestate::{call_frame_from_arena, storage_diff_from_state, ExecutionState},
+    CallTraceArena, GethTraceBuilder, TracingInspectorConfig,
+};
 
-pub use gas_analyzer_core::{trace::compute_state_updates, StateUpdate};
+use gas_analyzer_core::{
+    build_state_updates_from_prestate, classify_prestate_eligibility,
+    compute_state_updates_canonical, encoding::encode_state_updates_to_abi, PrestateEligibility,
+};
+
+pub use gas_analyzer_core::StateUpdate;
 
 sol! {
     /// Public values committed by the Gas Killer challenger program.
@@ -80,25 +98,46 @@ pub fn arena_to_default_frame(
     )
 }
 
-/// Extracts the Gas Killer state updates from a recorded execution trace and encodes
-/// them exactly as an honest operator signs them.
+/// Extracts the Gas Killer state updates from a recorded execution and encodes them
+/// exactly as an honest operator on a `prestate-net` fleet signs them.
+///
+/// `consumer` is the contract whose storage the payload is allowed to write, i.e. the
+/// call's target. Eligibility is decided against it, and it is the only account whose
+/// slots become stores.
 ///
 /// Returns the encoded `storageUpdates` bytes and the set of skipped (unsupported)
 /// opcodes, if any (SELFDESTRUCT, TSTORE). A non-empty skip set means the call is not
 /// representable as Gas Killer state updates and an honest operator would not have
-/// signed it either.
-pub fn encoded_state_updates_from_arena(
+/// signed it either. The net form reports none by construction: neither tracer sees
+/// opcodes, and eligibility already rules out the frames that would skip one.
+pub fn encoded_state_updates_from_execution(
+    consumer: Address,
+    state: &ExecutionState,
     arena: &CallTraceArena,
     gas_used: u64,
     output: Bytes,
 ) -> eyre::Result<(Bytes, Vec<String>)> {
-    let frame = arena_to_default_frame(arena, gas_used, output);
-    let (state_updates, skipped_opcodes, _call_gas_total) =
-        compute_state_updates(frame).map_err(|e| eyre::eyre!("{e:?}"))?;
-    let encoded = gas_analyzer_core::encoding::encode_state_updates_to_abi(&state_updates);
+    let diff = storage_diff_from_state(state);
+    let frame = call_frame_from_arena(arena, gas_used);
 
-    let mut skipped: Vec<String> = skipped_opcodes.into_iter().collect();
-    skipped.sort();
+    let (state_updates, skipped_opcodes) = match classify_prestate_eligibility(&frame, &diff, consumer)
+    {
+        PrestateEligibility::Eligible => {
+            (build_state_updates_from_prestate(consumer, &diff, &frame), Vec::new())
+        }
+        // No net form for this call, so the struct-log encoder produces the program.
+        // `Canonical` rather than `Legacy`: it is what `prestate-net` pairs with, and
+        // both of its representations stay revert-aware.
+        PrestateEligibility::Fallback(_) => {
+            let trace = arena_to_default_frame(arena, gas_used, output);
+            let (updates, skipped, _call_gas_total) =
+                compute_state_updates_canonical(trace, consumer).map_err(|e| eyre::eyre!("{e:?}"))?;
+            let mut skipped: Vec<String> =
+                skipped.into_iter().map(|op| format!("{op:?}")).collect();
+            skipped.sort();
+            (updates, skipped)
+        }
+    };
 
-    Ok((encoded, skipped))
+    Ok((encode_state_updates_to_abi(&state_updates), skipped_opcodes))
 }

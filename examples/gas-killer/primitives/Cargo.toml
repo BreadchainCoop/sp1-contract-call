@@ -10,7 +10,7 @@ version.workspace = true
 sp1-cc-client-executor = { path = "../../../crates/client-executor" }
 
 # gas-killer (pinned to the revision used by gas-killer/service)
-gas-analyzer-core = { git = "https://github.com/gas-killer/gas-analyzer", rev = "81b1ab9c858206cb7d04fcb9b325a68eaf450eb6" }
+gas-analyzer-core = { git = "https://github.com/gas-killer/gas-analyzer", rev = "3cbd54f802da8c6a25572e42145aedd51cb9a95e" }
 
 # alloy
 alloy-primitives = { workspace = true, features = ["serde"] }
