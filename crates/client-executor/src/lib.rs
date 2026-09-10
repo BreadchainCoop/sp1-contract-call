@@ -37,6 +37,7 @@ use reth_primitives::EthPrimitives;
 use revm::{
     context::{result::ExecutionResult, TxEnv},
     database::CacheDB,
+    state::EvmState,
 };
 use revm_primitives::{hardfork::SpecId, Address, Bytes, TxKind, B256, U256};
 use rsp_client_executor::io::{TrieDB, WitnessInput};
@@ -387,6 +388,12 @@ pub struct TracedExecution {
     pub gas_used: u64,
     /// The recorded call trace arena.
     pub arena: CallTraceArena,
+    /// The execution's final journal: every account and storage slot it touched,
+    /// each slot carrying both its original and its present value.
+    ///
+    /// Needed to derive a `prestateTracer` `diffMode` diff without a second
+    /// execution; see [`crate::prestate::storage_diff_from_state`].
+    pub state: EvmState,
 }
 
 /// An executor that executes smart contract calls inside a zkVM.
@@ -671,7 +678,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
         };
 
-        Ok(TracedExecution { output, gas_used, arena })
+        Ok(TracedExecution { output, gas_used, arena, state: tx_output.state })
     }
 
     /// Returns the decoded logs matching the provided `filter`.
