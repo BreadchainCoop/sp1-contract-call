@@ -11,7 +11,7 @@
 use std::{fmt::Debug, iter::once, sync::Arc};
 
 use alloy_consensus::ReceiptEnvelope;
-use alloy_evm::{Database, Evm};
+use alloy_evm::{Database, Evm, IntoTxEnv};
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_consensus::{ConsensusError, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
@@ -19,7 +19,10 @@ use reth_evm::{ConfigureEvm, EthEvm, EvmEnv};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives::{EthPrimitives, Header, NodePrimitives, SealedHeader};
 use revm::{
-    context::result::{HaltReason, ResultAndState},
+    context::{
+        result::{HaltReason, ResultAndState},
+        BlockEnv, CfgEnv, TxEnv,
+    },
     inspector::NoOpInspector,
     state::Bytecode,
     Context, MainBuilder, MainContext,
@@ -33,7 +36,7 @@ use rsp_primitives::genesis::Genesis;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{Anchor, ContractInput};
+use crate::{Anchor, ContractInput, EnvOverrides, ResolvedGasLimits};
 
 /// Information about how the contract executions accessed state, which is needed to execute the
 /// contract in SP1.
@@ -94,12 +97,19 @@ pub trait Primitives: NodePrimitives {
         chain_spec: Arc<Self::ChainSpec>,
     ) -> Result<(), ConsensusError>;
 
+    /// Execute a contract call.
+    ///
+    /// `overrides` adjusts the simulated gas limits and must be bit-identical
+    /// between the host that builds the sketch and the guest that proves the
+    /// execution; see [`EnvOverrides`]. `EnvOverrides::default()` follows the
+    /// header.
     fn transact<DB>(
         input: &ContractInput,
         db: DB,
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        overrides: EnvOverrides,
     ) -> Result<ResultAndState<Self::HaltReason>, String>
     where
         DB: Database;
@@ -111,18 +121,51 @@ pub trait Primitives: NodePrimitives {
     /// snapshots, ...). Use [`TracingInspectorConfig::default_geth`] for the opcode-hash
     /// use case; enable memory snapshots when the trace must reproduce a
     /// `debug_traceCall` `DefaultFrame` (e.g. Gas Killer state-update extraction).
+    ///
+    /// `overrides` applies as in [`Primitives::transact`], and carries the same
+    /// host/guest bit-identity requirement.
     fn transact_with_trace<DB>(
         input: &ContractInput,
         db: DB,
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        overrides: EnvOverrides,
         config: TracingInspectorConfig,
     ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String>
     where
         DB: Database;
 
     fn active_fork_name(chain_spec: &Self::ChainSpec, header: &Header) -> String;
+}
+
+/// Writes the gas limits an execution must run under into revm's config and
+/// block environments, and returns them so the caller can put the transaction
+/// limit on the `TxEnv` it passes to `Evm::transact`.
+///
+/// The transaction limit cannot be set through the context: `Evm::transact`
+/// replaces the context's transaction environment with the one converted from
+/// the [`ContractInput`], whose `TxEnv::default()` carries revm's 2^24 builder
+/// default. It must ride on the `TxEnv` handed to `transact` itself.
+///
+/// An overridden transaction limit also lifts revm's EIP-7825 per-transaction
+/// cap, which would otherwise clamp it from Osaka onwards and make the same
+/// execution diverge across the hardfork boundary. The cap is raised only to
+/// the override, so executions without one stay subject to the real cap.
+fn apply_gas_limits<Spec>(
+    cfg_env: &mut CfgEnv<Spec>,
+    block_env: &mut BlockEnv,
+    header: &Header,
+    overrides: EnvOverrides,
+) -> ResolvedGasLimits {
+    let limits = overrides.resolve(header.gas_limit);
+
+    block_env.gas_limit = limits.block;
+    if overrides.tx_gas_limit.is_some() {
+        cfg_env.tx_gas_limit_cap = Some(limits.tx);
+    }
+
+    limits
 }
 
 impl Primitives for EthPrimitives {
@@ -147,6 +190,7 @@ impl Primitives for EthPrimitives {
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        overrides: EnvOverrides,
     ) -> Result<ResultAndState<Self::HaltReason>, String> {
         let EvmEnv { mut cfg_env, mut block_env, .. } =
             EthEvmConfig::new(chain_spec).evm_env(header).unwrap();
@@ -158,18 +202,20 @@ impl Primitives for EthPrimitives {
         cfg_env.disable_balance_check = true;
         cfg_env.disable_fee_charge = true;
 
+        let limits = apply_gas_limits(&mut cfg_env, &mut block_env, header, overrides);
+
+        let mut tx_env: TxEnv = input.into_tx_env();
+        tx_env.gas_limit = limits.tx;
+
         let evm = Context::mainnet()
             .with_db(db)
             .with_cfg(cfg_env)
             .with_block(block_env)
-            .modify_tx_chained(|tx_env| {
-                tx_env.gas_limit = header.gas_limit;
-            })
             .build_mainnet_with_inspector(NoOpInspector {});
 
         let mut evm = EthEvm::new(evm, false);
 
-        evm.transact(input).map_err(|err| err.to_string())
+        evm.transact(tx_env).map_err(|err| err.to_string())
     }
 
     fn transact_with_trace<DB: Database>(
@@ -178,6 +224,7 @@ impl Primitives for EthPrimitives {
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        overrides: EnvOverrides,
         config: TracingInspectorConfig,
     ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
         let EvmEnv { mut cfg_env, mut block_env, .. } =
@@ -190,20 +237,22 @@ impl Primitives for EthPrimitives {
         cfg_env.disable_balance_check = true;
         cfg_env.disable_fee_charge = true;
 
+        let limits = apply_gas_limits(&mut cfg_env, &mut block_env, header, overrides);
+
         let inspector = TracingInspector::new(config);
+
+        let mut tx_env: TxEnv = input.into_tx_env();
+        tx_env.gas_limit = limits.tx;
 
         let evm = Context::mainnet()
             .with_db(db)
             .with_cfg(cfg_env)
             .with_block(block_env)
-            .modify_tx_chained(|tx_env| {
-                tx_env.gas_limit = header.gas_limit;
-            })
             .build_mainnet_with_inspector(inspector);
 
-        let mut evm = EthEvm::new(evm, true);  // true enables inspector
+        let mut evm = EthEvm::new(evm, true); // true enables inspector
 
-        let result = evm.transact(input).map_err(|err| err.to_string())?;
+        let result = evm.transact(tx_env).map_err(|err| err.to_string())?;
 
         // Extract the trace from the inspector
         let trace = evm.into_inner().inspector.into_traces();
@@ -241,6 +290,7 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        overrides: EnvOverrides,
     ) -> Result<ResultAndState<Self::HaltReason>, String> {
         use op_revm::{DefaultOp, OpBuilder};
 
@@ -254,18 +304,20 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         cfg_env.disable_balance_check = true;
         cfg_env.disable_fee_charge = true;
 
+        let limits = apply_gas_limits(&mut cfg_env, &mut block_env, header, overrides);
+
+        let mut tx_env: op_revm::OpTransaction<TxEnv> = input.into_tx_env();
+        tx_env.base.gas_limit = limits.tx;
+
         let evm = op_revm::OpContext::op()
             .with_db(db)
             .with_cfg(cfg_env)
             .with_block(block_env)
-            .modify_tx_chained(|tx_env| {
-                tx_env.base.gas_limit = header.gas_limit;
-            })
             .build_op_with_inspector(NoOpInspector {});
 
         let mut evm = alloy_op_evm::OpEvm::new(evm, false);
 
-        evm.transact(input).map_err(|err| err.to_string())
+        evm.transact(tx_env).map_err(|err| err.to_string())
     }
 
     fn transact_with_trace<DB: Database>(
@@ -274,11 +326,12 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         header: &Header,
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
+        overrides: EnvOverrides,
         _config: TracingInspectorConfig,
     ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
         // For Optimism, we currently don't support tracing due to API limitations.
         // Just run the regular transact and return an empty trace.
-        let result = Self::transact(input, db, header, difficulty, chain_spec)?;
+        let result = Self::transact(input, db, header, difficulty, chain_spec, overrides)?;
         Ok((result, CallTraceArena::default()))
     }
 
@@ -287,5 +340,204 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         let spec: &'static str = spec.into();
 
         spec.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ContractCalldata;
+    use alloy_primitives::{address, hex, keccak256, Bytes, U256 as PrimU256};
+    use revm::{
+        context::result::{ExecutionResult, HaltReason},
+        database::{CacheDB, EmptyDB},
+        state::AccountInfo,
+    };
+
+    /// ~40M-gas busy loop (1,000,000 iterations × ~40 gas), then return 42.
+    /// The compute deliberately exceeds the 30M header gas limit used below.
+    fn gigagas_burner_runtime() -> Bytes {
+        // PUSH3 1_000_000; JUMPDEST(4); DUP1; ISZERO; PUSH1 0x11; JUMPI;
+        // PUSH1 1; SWAP1; SUB; PUSH1 4; JUMP; JUMPDEST(0x11); POP;
+        // PUSH1 42; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN.
+        hex!("620f42405b8015601157600190036004565b50602a60005260206000f3").into()
+    }
+
+    /// A Cancun-era mainnet header with a 30M gas limit.
+    fn test_header() -> Header {
+        Header {
+            number: 20_000_000,
+            timestamp: 1_717_000_000, // post-Cancun mainnet timestamp
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(0),
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        }
+    }
+
+    fn burner_call_result(
+        overrides: crate::EnvOverrides,
+    ) -> revm::context::result::ResultAndState<HaltReason> {
+        let burner = address!("0x0000000000000000000000000000000000002001");
+        let mut db = CacheDB::new(EmptyDB::default());
+        let code = revm::state::Bytecode::new_raw(gigagas_burner_runtime());
+        db.insert_account_info(
+            burner,
+            AccountInfo {
+                balance: PrimU256::ZERO,
+                nonce: 0,
+                code_hash: keccak256(code.original_byte_slice()),
+                code: Some(code),
+            },
+        );
+
+        let input = ContractInput {
+            contract_address: burner,
+            caller_address: address!("0x0000000000000000000000000000000000000c11"),
+            calldata: ContractCalldata::Call(Bytes::new()),
+        };
+        let chain_spec = EthPrimitives::build_spec(&Genesis::Mainnet).unwrap();
+
+        EthPrimitives::transact(&input, db, &test_header(), U256::ZERO, chain_spec, overrides)
+            .expect("transact must not error at the EVM-construction level")
+    }
+
+    /// Without overrides an execution gets exactly the header's gas limit, so
+    /// the 40M-gas burner halts out of gas at 30M. The precise figure is the
+    /// point of the assertion: revm's `TxEnv` default caps a transaction at
+    /// 2^24 gas unless the limit is set on the env handed to `Evm::transact`,
+    /// and a silent cap there would make heavy honest executions diverge
+    /// between host and guest.
+    #[test]
+    fn burner_halts_out_of_gas_at_header_limit() {
+        let output = burner_call_result(crate::EnvOverrides::default());
+        match output.result {
+            ExecutionResult::Halt { reason: HaltReason::OutOfGas(_), gas_used } => {
+                assert_eq!(
+                    gas_used, 30_000_000,
+                    "execution must run out of gas at the header gas limit, not at another cap"
+                );
+            }
+            other => panic!("expected OutOfGas halt at the 30M header limit, got {other:?}"),
+        }
+    }
+
+    /// With both limits lifted to 2^40 the same call succeeds and burns more
+    /// gas than any real block admits — proving the override reaches revm's
+    /// block env, tx env, and the EIP-7825 cap alike.
+    #[test]
+    fn burner_succeeds_beyond_header_limit_with_overrides() {
+        let output = burner_call_result(crate::EnvOverrides::gas_limits(1 << 40));
+        match output.result {
+            ExecutionResult::Success { gas_used, output, .. } => {
+                assert!(
+                    gas_used > 30_000_000,
+                    "burner must consume more than the header gas limit, used {gas_used}"
+                );
+                assert_eq!(
+                    output.data().as_ref(),
+                    PrimU256::from(42).to_be_bytes::<32>(),
+                    "burner must return 42"
+                );
+            }
+            other => panic!("expected success under unbounded overrides, got {other:?}"),
+        }
+    }
+
+    /// A transaction-only override above the header limit must still execute:
+    /// revm rejects a transaction whose gas limit exceeds the block's, so the
+    /// resolved block limit has to rise with it.
+    #[test]
+    fn burner_succeeds_with_tx_only_override() {
+        let output = burner_call_result(crate::EnvOverrides {
+            block_gas_limit: None,
+            tx_gas_limit: Some(1 << 40),
+        });
+        match output.result {
+            ExecutionResult::Success { gas_used, .. } => {
+                assert!(
+                    gas_used > 30_000_000,
+                    "burner must consume more than the header gas limit, used {gas_used}"
+                );
+            }
+            other => panic!("expected success under a tx-only override, got {other:?}"),
+        }
+    }
+
+    /// The hash must commit to the limits the EVM actually ran with, including
+    /// the block limit implicitly raised to carry a larger transaction limit.
+    #[test]
+    fn tx_only_override_binds_the_raised_block_limit() {
+        let overrides = crate::EnvOverrides { block_gas_limit: None, tx_gas_limit: Some(1 << 40) };
+        let limits = overrides.resolve(30_000_000);
+
+        assert_eq!(limits.tx, 1 << 40);
+        assert_eq!(limits.block, 1 << 40, "block limit must cover the tx limit");
+        assert_eq!(
+            overrides.resolve(30_000_000),
+            crate::EnvOverrides::gas_limits(1 << 40).resolve(30_000_000),
+            "both spellings of the same profile must resolve identically"
+        );
+    }
+
+    /// The `chainConfigHash` binds the overrides: the plain [`ChainConfig`]
+    /// hash when none are set, a distinct [`ChainConfigWithEnvOverrides`] hash
+    /// otherwise, each round-tripping through its verifier and rejecting the
+    /// other.
+    #[test]
+    fn chain_config_hash_binds_overrides() {
+        use crate::{verifiy_chain_config_eth, verify_chain_config_eth_with_overrides};
+        use revm_primitives::hardfork::SpecId;
+
+        let chain_id = 1u64;
+        let header_gas_limit = 30_000_000u64;
+        let legacy = {
+            let config = crate::ChainConfig {
+                chainId: PrimU256::from(chain_id),
+                activeForkName: SpecId::CANCUN.to_string(),
+            };
+            keccak256(alloy_sol_types::SolValue::abi_encode_packed(&config))
+        };
+        let overridden = {
+            let config = crate::ChainConfigWithEnvOverrides {
+                chainId: PrimU256::from(chain_id),
+                activeForkName: SpecId::CANCUN.to_string(),
+                blockGasLimitOverride: 1 << 40,
+                txGasLimitOverride: 1 << 40,
+            };
+            keccak256(alloy_sol_types::SolValue::abi_encode_packed(&config))
+        };
+        assert_ne!(legacy, overridden, "overrides must change the chain config hash");
+
+        verifiy_chain_config_eth(legacy, chain_id, SpecId::CANCUN).unwrap();
+        verify_chain_config_eth_with_overrides(
+            overridden,
+            chain_id,
+            SpecId::CANCUN,
+            crate::EnvOverrides::gas_limits(1 << 40),
+            header_gas_limit,
+        )
+        .unwrap();
+        // Cross-checks must fail: a proof under lifted limits cannot satisfy a
+        // verifier expecting header-derived limits, and vice versa.
+        assert!(verifiy_chain_config_eth(overridden, chain_id, SpecId::CANCUN).is_err());
+        assert!(verify_chain_config_eth_with_overrides(
+            legacy,
+            chain_id,
+            SpecId::CANCUN,
+            crate::EnvOverrides::gas_limits(1 << 40),
+            header_gas_limit,
+        )
+        .is_err());
+        // No-override verification degenerates to the legacy path.
+        verify_chain_config_eth_with_overrides(
+            legacy,
+            chain_id,
+            SpecId::CANCUN,
+            crate::EnvOverrides::default(),
+            header_gas_limit,
+        )
+        .unwrap();
     }
 }

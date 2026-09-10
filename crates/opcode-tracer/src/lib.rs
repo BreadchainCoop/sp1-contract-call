@@ -160,6 +160,7 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
         sketch.anchor.header(),
         alloy_primitives::U256::ZERO,
         chain_spec,
+        Default::default(),
         sp1_cc_client_executor::TracingInspectorConfig::default_geth(),
     )
     .map_err(|e: String| eyre::eyre!(e))?;

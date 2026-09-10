@@ -37,6 +37,7 @@ use reth_primitives::EthPrimitives;
 use revm::{
     context::{result::ExecutionResult, TxEnv},
     database::CacheDB,
+    state::EvmState,
 };
 use revm_primitives::{hardfork::SpecId, Address, Bytes, TxKind, B256, U256};
 use rsp_client_executor::io::{TrieDB, WitnessInput};
@@ -51,6 +52,8 @@ pub use anchor::{
 pub mod io;
 
 pub mod inspector;
+
+pub mod prestate;
 pub use inspector::{
     CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, GethTraceBuilder, TracingInspector,
     TracingInspectorConfig,
@@ -122,6 +125,95 @@ impl ContractInput {
     }
 }
 
+/// Environment overrides for contract execution.
+///
+/// With every field `None`, execution uses the anchored header's gas limit.
+/// Setting a field lifts the corresponding simulated limit, enabling
+/// *unbounded execution*: contract calls whose compute exceeds any real block,
+/// where only a small signed state diff ever lands on-chain.
+///
+/// # Determinism is protocol-critical
+///
+/// The same overrides MUST be used bit-identically by:
+/// 1. the **host** (`EvmSketch::call*_with_overrides`) — otherwise the sketch
+///    stops prefetching state at the point the host execution halted, and the
+///    guest panics on a missing witness;
+/// 2. the **guest** (`ClientExecutor::execute_with_overrides`) — otherwise a
+///    heavy-but-honest execution runs out of gas in the proof and re-derives a
+///    different result, falsely incriminating an honest operator;
+/// 3. every other party re-deriving the execution.
+///
+/// This crate provides the mechanism only; canonical override values are
+/// pinned, versioned constants owned by the consumer. When any override is
+/// set, the *resolved* limits (see [`EnvOverrides::resolve`]) are bound into
+/// the proof's `chainConfigHash` via [`ChainConfigWithEnvOverrides`], so a
+/// proof produced under different limits cannot satisfy a verifier expecting
+/// this profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnvOverrides {
+    /// Overrides the block gas limit during simulation.
+    pub block_gas_limit: Option<u64>,
+    /// Overrides the transaction gas limit during simulation. Also lifts the
+    /// EIP-7825 per-transaction cap (2^24, Osaka onwards) to the same value,
+    /// so an override behaves identically across the hardfork boundary.
+    pub tx_gas_limit: Option<u64>,
+}
+
+/// The gas limits an execution actually runs under, derived from
+/// [`EnvOverrides`] and the anchored header by [`EnvOverrides::resolve`].
+///
+/// Both the EVM environment and the `chainConfigHash` are built from this one
+/// value, so the hash always describes the environment the execution really
+/// used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedGasLimits {
+    /// The block gas limit placed on revm's block env.
+    pub block: u64,
+    /// The transaction gas limit placed on the `TxEnv`, and on revm's EIP-7825
+    /// per-transaction cap when overridden.
+    pub tx: u64,
+}
+
+impl EnvOverrides {
+    /// Overrides with both gas limits set to `gas_limit`.
+    pub fn gas_limits(gas_limit: u64) -> Self {
+        Self { block_gas_limit: Some(gas_limit), tx_gas_limit: Some(gas_limit) }
+    }
+
+    /// `true` when no override is set, so execution follows the header.
+    pub fn is_unset(&self) -> bool {
+        self.block_gas_limit.is_none() && self.tx_gas_limit.is_none()
+    }
+
+    /// Resolves the overrides against the anchored header's gas limit.
+    ///
+    /// Unset fields fall back to `header_gas_limit`. The block limit is then
+    /// raised to at least the transaction limit: revm rejects a transaction
+    /// whose gas limit exceeds the block's, so a transaction-only override
+    /// above the header limit would otherwise fail validation instead of
+    /// executing.
+    ///
+    /// This is the single point where limits are decided. Every caller —
+    /// execution, `chainConfigHash` construction, and verification — must go
+    /// through it, so the committed hash can never describe limits other than
+    /// the ones the EVM ran with.
+    pub fn resolve(&self, header_gas_limit: u64) -> ResolvedGasLimits {
+        let tx = self.tx_gas_limit.unwrap_or(header_gas_limit);
+        let block = self.block_gas_limit.unwrap_or(header_gas_limit).max(tx);
+
+        ResolvedGasLimits { block, tx }
+    }
+
+    /// The resolved limits when any override is set, `None` when none is.
+    ///
+    /// `None` selects the plain [`ChainConfig`] hash, so this is the single
+    /// place that decides whether an execution's `chainConfigHash` carries
+    /// gas limits at all.
+    fn resolved_overrides(&self, header_gas_limit: u64) -> Option<ResolvedGasLimits> {
+        (!self.is_unset()).then(|| self.resolve(header_gas_limit))
+    }
+}
+
 impl IntoTxEnv<TxEnv> for &ContractInput {
     fn into_tx_env(self) -> TxEnv {
         TxEnv {
@@ -188,6 +280,49 @@ sol! {
         uint chainId;
         string activeForkName;
     }
+
+    /// Chain config extended with execution-environment overrides.
+    ///
+    /// Hashed into `chainConfigHash` instead of `ChainConfig` whenever
+    /// [`EnvOverrides`] are active, so the proof commits to the exact
+    /// simulated gas limits: a proof produced under lifted limits can never
+    /// satisfy a verifier expecting header-derived limits, and vice versa.
+    #[derive(Debug)]
+    struct ChainConfigWithEnvOverrides {
+        uint chainId;
+        string activeForkName;
+        uint64 blockGasLimitOverride;
+        uint64 txGasLimitOverride;
+    }
+}
+
+/// The `chainConfigHash` for an execution that ran under `limits`.
+///
+/// `None` produces the plain [`ChainConfig`] hash, bit-identical to the one
+/// produced before overrides existed, so proofs and verifiers that never opt
+/// in are unaffected. Otherwise the limits are folded in, binding the proof to
+/// the exact simulated environment.
+///
+/// The guest and the verifier both hash through this function, so the value
+/// committed in a proof and the value a verifier expects cannot drift apart.
+fn compute_chain_config_hash(
+    chain_id: u64,
+    active_fork_name: String,
+    limits: Option<ResolvedGasLimits>,
+) -> B256 {
+    let encoded = match limits {
+        None => ChainConfig { chainId: U256::from(chain_id), activeForkName: active_fork_name }
+            .abi_encode_packed(),
+        Some(limits) => ChainConfigWithEnvOverrides {
+            chainId: U256::from(chain_id),
+            activeForkName: active_fork_name,
+            blockGasLimitOverride: limits.block,
+            txGasLimitOverride: limits.tx,
+        }
+        .abi_encode_packed(),
+    };
+
+    keccak256(encoded)
 }
 
 impl ContractPublicValues {
@@ -253,6 +388,12 @@ pub struct TracedExecution {
     pub gas_used: u64,
     /// The recorded call trace arena.
     pub arena: CallTraceArena,
+    /// The execution's final journal: every account and storage slot it touched,
+    /// each slot carrying both its original and its present value.
+    ///
+    /// Needed to derive a `prestateTracer` `diffMode` diff without a second
+    /// execution; see [`crate::prestate::storage_diff_from_state`].
+    pub state: EvmState,
 }
 
 /// An executor that executes smart contract calls inside a zkVM.
@@ -352,9 +493,32 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     ///
     /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
     pub fn execute(&self, call: ContractInput) -> eyre::Result<ContractPublicValues> {
+        self.execute_with_overrides(call, EnvOverrides::default())
+    }
+
+    /// [`execute`] under explicit [`EnvOverrides`].
+    ///
+    /// The overrides must match the ones the host used when building the
+    /// sketch: a guest that executes further than the host prefetched panics
+    /// on a missing state witness. Active overrides are committed in
+    /// `chainConfigHash`, so the proof names the environment it ran under.
+    ///
+    /// [`execute`]: ClientExecutor::execute
+    pub fn execute_with_overrides(
+        &self,
+        call: ContractInput,
+        overrides: EnvOverrides,
+    ) -> eyre::Result<ContractPublicValues> {
         let cache_db = CacheDB::new(&self.witness_db);
-        let tx_output =
-            P::transact(&call, cache_db, self.header, U256::ZERO, self.chain_spec.clone()).unwrap();
+        let tx_output = P::transact(
+            &call,
+            cache_db,
+            self.header,
+            U256::ZERO,
+            self.chain_spec.clone(),
+            overrides,
+        )
+        .unwrap();
 
         let tx_output_bytes = match tx_output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),
@@ -368,7 +532,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.anchor.id,
             self.anchor.hash,
             self.anchor.ty,
-            self.chain_config_hash,
+            self.chain_config_hash_with_overrides(overrides),
         );
 
         Ok(public_values)
@@ -398,6 +562,21 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
         &self,
         call: ContractInput,
     ) -> eyre::Result<ContractPublicValuesWithTrace> {
+        self.execute_with_trace_and_overrides(call, EnvOverrides::default())
+    }
+
+    /// [`execute_with_trace`] under explicit [`EnvOverrides`].
+    ///
+    /// See [`execute_with_overrides`] for the host/guest consistency and
+    /// `chainConfigHash` binding rules.
+    ///
+    /// [`execute_with_trace`]: ClientExecutor::execute_with_trace
+    /// [`execute_with_overrides`]: ClientExecutor::execute_with_overrides
+    pub fn execute_with_trace_and_overrides(
+        &self,
+        call: ContractInput,
+        overrides: EnvOverrides,
+    ) -> eyre::Result<ContractPublicValuesWithTrace> {
         let cache_db = CacheDB::new(&self.witness_db);
         let (tx_output, trace) = P::transact_with_trace(
             &call,
@@ -405,6 +584,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.header,
             U256::ZERO,
             self.chain_spec.clone(),
+            overrides,
             TracingInspectorConfig::default_geth(),
         )
         .unwrap();
@@ -424,7 +604,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.anchor.id,
             self.anchor.hash,
             self.anchor.ty,
-            self.chain_config_hash,
+            self.chain_config_hash_with_overrides(overrides),
             opcode_hash,
         );
 
@@ -441,6 +621,29 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
+    /// [`execute_and_commit`] under explicit [`EnvOverrides`].
+    ///
+    /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
+    pub fn execute_and_commit_with_overrides(&self, call: ContractInput, overrides: EnvOverrides) {
+        let public_values = self.execute_with_overrides(call, overrides).unwrap();
+        sp1_zkvm::io::commit_slice(&public_values.abi_encode());
+    }
+
+    /// The `chainConfigHash` to commit for an execution under `overrides`.
+    ///
+    /// Reuses the hash computed at construction when no override is active.
+    fn chain_config_hash_with_overrides(&self, overrides: EnvOverrides) -> B256 {
+        if overrides.is_unset() {
+            self.chain_config_hash
+        } else {
+            compute_chain_config_hash(
+                self.chain_spec.chain_id(),
+                P::active_fork_name(&self.chain_spec, self.header),
+                overrides.resolved_overrides(self.header.gas_limit),
+            )
+        }
+    }
+
     /// Executes the smart contract call and returns the raw traced execution:
     /// the call output, the gas used, and the full [`CallTraceArena`] recorded by a
     /// [`TracingInspector`] configured with `config`.
@@ -454,6 +657,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     pub fn execute_traced(
         &self,
         call: &ContractInput,
+        overrides: EnvOverrides,
         config: TracingInspectorConfig,
     ) -> eyre::Result<TracedExecution> {
         let cache_db = CacheDB::new(&self.witness_db);
@@ -463,6 +667,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.header,
             U256::ZERO,
             self.chain_spec.clone(),
+            overrides,
             config,
         )
         .unwrap();
@@ -473,7 +678,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
         };
 
-        Ok(TracedExecution { output, gas_used, arena })
+        Ok(TracedExecution { output, gas_used, arena, state: tx_output.state })
     }
 
     /// Returns the decoded logs matching the provided `filter`.
@@ -496,12 +701,19 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     }
 
     fn hash_chain_config(chain_spec: &P::ChainSpec, execution_header: &Header) -> B256 {
-        let chain_config = ChainConfig {
-            chainId: U256::from(chain_spec.chain_id()),
-            activeForkName: P::active_fork_name(chain_spec, execution_header),
-        };
+        compute_chain_config_hash(
+            chain_spec.chain_id(),
+            P::active_fork_name(chain_spec, execution_header),
+            None,
+        )
+    }
+}
 
-        keccak256(chain_config.abi_encode_packed())
+fn match_chain_config_hash(claimed: B256, expected: B256) -> Result<(), ClientError> {
+    if claimed == expected {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidChainConfig)
     }
 }
 
@@ -513,16 +725,33 @@ pub fn verifiy_chain_config_eth(
     chain_id: u64,
     active_fork: SpecId,
 ) -> Result<(), ClientError> {
-    let chain_config =
-        ChainConfig { chainId: U256::from(chain_id), activeForkName: active_fork.to_string() };
+    match_chain_config_hash(
+        chain_config_hash,
+        compute_chain_config_hash(chain_id, active_fork.to_string(), None),
+    )
+}
 
-    let hash = keccak256(chain_config.abi_encode_packed());
-
-    if chain_config_hash == hash {
-        Ok(())
-    } else {
-        Err(ClientError::InvalidChainConfig)
-    }
+/// Verifies a chain config hash produced under [`EnvOverrides`].
+///
+/// The verifier must supply the exact overrides the proof claims and the gas
+/// limit of the header it was anchored to; together they resolve to the limits
+/// the execution ran under. With unset overrides this reduces to
+/// [`verifiy_chain_config_eth`] and `header_gas_limit` is ignored.
+pub fn verify_chain_config_eth_with_overrides(
+    chain_config_hash: B256,
+    chain_id: u64,
+    active_fork: SpecId,
+    overrides: EnvOverrides,
+    header_gas_limit: u64,
+) -> Result<(), ClientError> {
+    match_chain_config_hash(
+        chain_config_hash,
+        compute_chain_config_hash(
+            chain_id,
+            active_fork.to_string(),
+            overrides.resolved_overrides(header_gas_limit),
+        ),
+    )
 }
 
 #[cfg(feature = "optimism")]
@@ -533,16 +762,11 @@ pub fn verifiy_chain_config_optimism(
     active_fork: op_revm::OpSpecId,
 ) -> Result<(), ClientError> {
     let active_fork: &'static str = active_fork.into();
-    let chain_config =
-        ChainConfig { chainId: U256::from(chain_id), activeForkName: active_fork.to_string() };
 
-    let hash = keccak256(chain_config.abi_encode_packed());
-
-    if chain_config_hash == hash {
-        Ok(())
-    } else {
-        Err(ClientError::InvalidChainConfig)
-    }
+    match_chain_config_hash(
+        chain_config_hash,
+        compute_chain_config_hash(chain_id, active_fork.to_string(), None),
+    )
 }
 
 /// Opcode byte values for state-modifying operations.

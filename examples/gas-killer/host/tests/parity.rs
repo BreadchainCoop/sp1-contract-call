@@ -1,17 +1,19 @@
 //! Byte-parity test between the challenger guest pipeline and the production
 //! gas-analyzer pipeline.
 //!
-//! An honest Gas Killer operator derives the signed `storageUpdates` bytes with:
-//! `debug_traceCall` (enableMemory, disableStorage) -> `compute_state_updates` ->
-//! `encode_state_updates_to_abi`. Slashing is only sound if the challenger guest
-//! produces byte-identical output for the same call — otherwise honest operators
-//! could be slashed. This test runs both pipelines for the same call and asserts
-//! byte equality:
+//! An honest Gas Killer operator on the deployed fleet runs `STATE_ENCODING=prestate-net`,
+//! deriving the signed `storageUpdates` bytes from two cheap tracers rather than a
+//! struct-log trace: `prestateTracer` in `diffMode` plus `callTracer` with logs, fed
+//! through `classify_prestate_eligibility` and then either
+//! `build_state_updates_from_prestate` or, for calls with no net form,
+//! `compute_state_updates_canonical`. Slashing is only sound if the challenger guest
+//! produces byte-identical output for the same call, or honest operators get slashed.
+//! This test runs both pipelines for the same call and asserts byte equality:
 //!
-//! - production: anvil forked at the anchor block serves `debug_traceCall`, the
-//!   trace is processed with the same `gas-analyzer-core` functions the service uses
+//! - production: anvil forked at the anchor block serves both tracers, and the outputs
+//!   are processed with the same `gas-analyzer-core` functions the service uses
 //! - challenger: `EvmSketch` witnesses the state, and the guest pipeline
-//!   (`execute_traced` + `encoded_state_updates_from_arena`) derives the updates
+//!   (`execute_traced` + `encoded_state_updates_from_execution`) derives the updates
 //!
 //! Requires network access and the `anvil` binary:
 //! ```text
@@ -23,11 +25,16 @@ use alloy_node_bindings::Anvil;
 use alloy_primitives::{address, bytes, Address, Bytes, TxKind};
 use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use alloy_rpc_types::{
-    trace::geth::{DefaultFrame, GethDebugTracingCallOptions, GethDefaultTracingOptions},
+    trace::geth::{
+        CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugTracingCallOptions,
+        GethDebugTracingOptions, GethDefaultTracingOptions, PreStateConfig,
+    },
     BlockNumberOrTag, TransactionInput, TransactionRequest,
 };
-use gas_killer_primitives::{challenger_inspector_config, encoded_state_updates_from_arena};
-use sp1_cc_client_executor::{ClientExecutor, ContractCalldata, ContractInput, Genesis};
+use gas_killer_primitives::{challenger_inspector_config, encoded_state_updates_from_execution};
+use sp1_cc_client_executor::{
+    ClientExecutor, ContractCalldata, ContractInput, EnvOverrides, Genesis,
+};
 use sp1_cc_host_executor::EvmSketch;
 use url::Url;
 
@@ -49,9 +56,9 @@ fn approve_calldata() -> Bytes {
     )
 }
 
-/// The production pipeline: `debug_traceCall` against an anvil fork of the anchor
-/// block, processed with gas-analyzer-core (same options as
-/// `gas_analyzer_rpc::get_trace_from_call`).
+/// The production pipeline for a `prestate-net` fleet: `prestateTracer` in `diffMode`
+/// plus `callTracer` with logs, against an anvil fork of the anchor block, processed
+/// with gas-analyzer-core exactly as `extract_state_updates_hybrid` does.
 async fn production_storage_updates(calldata: Bytes) -> Bytes {
     let anvil = Anvil::new()
         .fork(sepolia_rpc_url())
@@ -67,29 +74,80 @@ async fn production_storage_updates(calldata: Bytes) -> Bytes {
         ..Default::default()
     };
 
-    let options = GethDebugTracingCallOptions {
-        tracing_options: alloy_rpc_types::trace::geth::GethDebugTracingOptions {
-            config: GethDefaultTracingOptions {
-                enable_memory: Some(true),
-                disable_storage: Some(true),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let frame: DefaultFrame = provider
+    let diff: DiffMode = provider
         .raw_request(
             "debug_traceCall".into(),
-            (tx, BlockNumberOrTag::Latest, options),
+            (
+                tx.clone(),
+                BlockNumberOrTag::Latest,
+                GethDebugTracingCallOptions {
+                    tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig {
+                        diff_mode: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
         )
         .await
-        .expect("debug_traceCall failed");
+        .expect("prestateTracer debug_traceCall failed");
 
-    let (state_updates, skipped, _call_gas) =
-        gas_analyzer_core::compute_state_updates(frame).expect("compute_state_updates failed");
-    assert!(skipped.is_empty(), "production pipeline skipped opcodes: {skipped:?}");
+    let frame: CallFrame = provider
+        .raw_request(
+            "debug_traceCall".into(),
+            (
+                tx.clone(),
+                BlockNumberOrTag::Latest,
+                GethDebugTracingCallOptions {
+                    tracing_options: GethDebugTracingOptions::call_tracer(CallConfig {
+                        with_log: Some(true),
+                        only_top_call: Some(false),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("callTracer debug_traceCall failed");
+
+    let state_updates = match gas_analyzer_core::classify_prestate_eligibility(
+        &frame, &diff, CONTRACT,
+    ) {
+        gas_analyzer_core::PrestateEligibility::Eligible => {
+            gas_analyzer_core::build_state_updates_from_prestate(CONTRACT, &diff, &frame)
+        }
+        // No net form, so production falls back to the struct-log encoder. Fetching the
+        // struct-log trace only on this path mirrors the analyzer: the net form never
+        // pays for it.
+        gas_analyzer_core::PrestateEligibility::Fallback(_) => {
+            let struct_log: DefaultFrame = provider
+                .raw_request(
+                    "debug_traceCall".into(),
+                    (
+                        tx,
+                        BlockNumberOrTag::Latest,
+                        GethDebugTracingCallOptions {
+                            tracing_options: GethDebugTracingOptions {
+                                config: GethDefaultTracingOptions {
+                                    enable_memory: Some(true),
+                                    disable_storage: Some(true),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .expect("struct-log debug_traceCall failed");
+            let (updates, skipped, _call_gas) =
+                gas_analyzer_core::compute_state_updates_canonical(struct_log, CONTRACT)
+                    .expect("compute_state_updates_canonical failed");
+            assert!(skipped.is_empty(), "production pipeline skipped opcodes: {skipped:?}");
+            updates
+        }
+    };
 
     gas_analyzer_core::encode_state_updates_to_abi(&state_updates)
 }
@@ -115,11 +173,16 @@ async fn challenger_storage_updates(calldata: Bytes) -> Bytes {
 
     let executor = ClientExecutor::eth(&input).expect("client executor failed");
     let traced = executor
-        .execute_traced(&call, challenger_inspector_config())
+        .execute_traced(&call, EnvOverrides::default(), challenger_inspector_config())
         .expect("traced execution failed");
-    let (storage_updates, skipped) =
-        encoded_state_updates_from_arena(&traced.arena, traced.gas_used, traced.output.clone())
-            .expect("state update extraction failed");
+    let (storage_updates, skipped) = encoded_state_updates_from_execution(
+        call.contract_address,
+        &traced.state,
+        &traced.arena,
+        traced.gas_used,
+        traced.output.clone(),
+    )
+    .expect("state update extraction failed");
     assert!(skipped.is_empty(), "challenger pipeline skipped opcodes: {skipped:?}");
 
     storage_updates

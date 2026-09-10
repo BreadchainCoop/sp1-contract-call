@@ -14,7 +14,7 @@ use rsp_primitives::{account_proof::eip1186_proof_to_account_proof, genesis::Gen
 use rsp_rpc_db::{BasicRpcDb, RpcDb};
 use sp1_cc_client_executor::{
     io::{EvmSketchInput, Primitives},
-    Anchor, CallTraceArena, ContractInput,
+    Anchor, CallTraceArena, ContractInput, EnvOverrides,
 };
 
 use crate::{EvmSketchBuilder, HostError};
@@ -58,11 +58,30 @@ where
         caller_address: Address,
         calldata: C,
     ) -> eyre::Result<C::Return> {
+        self.call_with_overrides(contract_address, caller_address, calldata, Default::default())
+            .await
+    }
+
+    /// [`Self::call`] under explicit [`EnvOverrides`].
+    ///
+    /// The overrides MUST equal the ones the guest will execute with
+    /// (`ClientExecutor::execute_with_overrides`): the sketch records exactly
+    /// the state this host execution touches, so a host that halts early (e.g.
+    /// OOG at the header gas limit while the guest runs unbounded) produces a
+    /// witness the guest cannot complete on.
+    pub async fn call_with_overrides<C: SolCall>(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        calldata: C,
+        overrides: EnvOverrides,
+    ) -> eyre::Result<C::Return> {
         let cache_db = CacheDB::new(&self.rpc_db);
         let chain_spec = PT::build_spec(&self.genesis)?;
         let input = ContractInput::new_call(contract_address, caller_address, calldata);
-        let output = PT::transact(&input, cache_db, self.anchor.header(), U256::ZERO, chain_spec)
-            .map_err(|err| eyre!(err))?;
+        let output =
+            PT::transact(&input, cache_db, self.anchor.header(), U256::ZERO, chain_spec, overrides)
+                .map_err(|err| eyre!(err))?;
 
         let output_bytes = match output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),
@@ -87,6 +106,25 @@ where
         caller_address: Address,
         calldata: C,
     ) -> eyre::Result<(C::Return, CallTraceArena)> {
+        self.call_with_trace_and_overrides(
+            contract_address,
+            caller_address,
+            calldata,
+            Default::default(),
+        )
+        .await
+    }
+
+    /// [`Self::call_with_trace`] under explicit [`EnvOverrides`].
+    ///
+    /// See [`Self::call_with_overrides`] for the host/guest consistency rule.
+    pub async fn call_with_trace_and_overrides<C: SolCall>(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        calldata: C,
+        overrides: EnvOverrides,
+    ) -> eyre::Result<(C::Return, CallTraceArena)> {
         let cache_db = CacheDB::new(&self.rpc_db);
         let chain_spec = PT::build_spec(&self.genesis)?;
         let input = ContractInput::new_call(contract_address, caller_address, calldata);
@@ -96,6 +134,7 @@ where
             self.anchor.header(),
             U256::ZERO,
             chain_spec,
+            overrides,
             sp1_cc_client_executor::TracingInspectorConfig::default_geth(),
         )
         .map_err(|err| eyre!(err))?;
@@ -111,10 +150,22 @@ where
 
     /// Executes a smart contract call, using the provided [`ContractInput`].
     pub async fn call_raw(&self, input: &ContractInput) -> eyre::Result<Bytes> {
+        self.call_raw_with_overrides(input, Default::default()).await
+    }
+
+    /// [`Self::call_raw`] under explicit [`EnvOverrides`].
+    ///
+    /// See [`Self::call_with_overrides`] for the host/guest consistency rule.
+    pub async fn call_raw_with_overrides(
+        &self,
+        input: &ContractInput,
+        overrides: EnvOverrides,
+    ) -> eyre::Result<Bytes> {
         let cache_db = CacheDB::new(&self.rpc_db);
         let chain_spec = PT::build_spec(&self.genesis)?;
-        let output = PT::transact(input, cache_db, self.anchor.header(), U256::ZERO, chain_spec)
-            .map_err(|err| eyre!(err))?;
+        let output =
+            PT::transact(input, cache_db, self.anchor.header(), U256::ZERO, chain_spec, overrides)
+                .map_err(|err| eyre!(err))?;
 
         let output_bytes = match output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),
@@ -130,8 +181,15 @@ where
         let cache_db = CacheDB::new(&self.rpc_db);
         let chain_spec = PT::build_spec(&self.genesis)?;
         let input = ContractInput::new_create(caller_address, calldata);
-        let output = PT::transact(&input, cache_db, self.anchor.header(), U256::ZERO, chain_spec)
-            .map_err(|err| eyre!(err))?;
+        let output = PT::transact(
+            &input,
+            cache_db,
+            self.anchor.header(),
+            U256::ZERO,
+            chain_spec,
+            Default::default(),
+        )
+        .map_err(|err| eyre!(err))?;
 
         let output_bytes = match output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),

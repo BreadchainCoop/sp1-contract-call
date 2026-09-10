@@ -47,7 +47,7 @@ alloy-consensus = { workspace = true, features = ["serde", "serde-bincode-compat
 alloy-eips.workspace = true
 alloy-sol-types.workspace = true
 alloy-primitives.workspace = true
-alloy-rpc-types = { workspace = true }
+alloy-rpc-types = { workspace = true, features = ["trace"] }
 alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
 alloy-evm.workspace = true
 alloy-op-evm = { workspace = true, optional = true }

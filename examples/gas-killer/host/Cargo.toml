@@ -50,7 +50,7 @@ sp1-sdk.workspace = true
 
 [dev-dependencies]
 alloy-node-bindings.workspace = true
-gas-analyzer-core = { git = "https://github.com/gas-killer/gas-analyzer", rev = "81b1ab9c858206cb7d04fcb9b325a68eaf450eb6" }
+gas-analyzer-core = { git = "https://github.com/gas-killer/gas-analyzer", rev = "3cbd54f802da8c6a25572e42145aedd51cb9a95e" }
 
 [build-dependencies]
 sp1-build.workspace = true
