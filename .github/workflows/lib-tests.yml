@@ -1,0 +1,42 @@
+name: Library tests
+
+# The `PR` workflow builds the SP1 examples, which requires self-hosted
+# runners and RPC secrets. This job covers the library crates on a hosted
+# runner with no secrets, so their unit tests are enforced on every PR.
+
+on:
+  push:
+    branches: [main, cancun-v1]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: clippy and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      # Must match rust-toolchain.toml, which otherwise pulls its own copy of
+      # the toolchain without clippy.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: |
+          cargo clippy -p sp1-cc-client-executor --all-targets -- -D warnings
+          cargo clippy -p sp1-cc-client-executor --all-targets --features optimism -- -D warnings
+          cargo clippy -p sp1-cc-host-executor --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test -p sp1-cc-client-executor --lib

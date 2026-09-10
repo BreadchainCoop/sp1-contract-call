@@ -358,10 +358,10 @@ impl<P: Provider<AnyNetwork>> ChainedBeaconAnchorBuilder<P> {
 impl<P: Provider<AnyNetwork>> AnchorBuilder for ChainedBeaconAnchorBuilder<P> {
     /// Builds a chained beacon anchor for the given block ID.
     async fn build<B: Into<BlockId> + Send>(&self, block_id: B) -> Result<Anchor, HostError> {
-        let execution_header =
-            self.beacon_anchor_builder.header_anchor_builder.get_header(block_id).await?;
-        let reference_header =
-            self.beacon_anchor_builder.header_anchor_builder.get_header(self.reference).await?;
+        let (execution_header, reference_header) = tokio::try_join!(
+            self.beacon_anchor_builder.header_anchor_builder.get_header(block_id),
+            self.beacon_anchor_builder.header_anchor_builder.get_header(self.reference)
+        )?;
         assert!(
             execution_header.number < reference_header.number,
             "The execution block must be an ancestor of the reference block"

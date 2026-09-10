@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_primitives::B256;
 use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use alloy_rpc_client::RpcClient;
 use reth_primitives::EthPrimitives;
@@ -23,6 +24,12 @@ pub struct EvmSketchBuilder<P, PT, A> {
     genesis: Genesis,
     provider: P,
     anchor_builder: A,
+    /// When `true` (default), fetch block N-1 to seed `BasicRpcDb` with the parent
+    /// state root. Set to `false` via [`without_state_root_seed`] when the caller
+    /// never invokes [`EvmSketch::finalize`] and wants to save one RPC round-trip.
+    ///
+    /// [`without_state_root_seed`]: EvmSketchBuilder::without_state_root_seed
+    seed_state_root: bool,
     phantom: PhantomData<PT>,
 }
 
@@ -32,9 +39,20 @@ impl<P, PT, A> EvmSketchBuilder<P, PT, A> {
         self.block = block.into();
         self
     }
+
     /// Sets the chain on which the contract will be called.
     pub fn with_genesis(mut self, genesis: Genesis) -> Self {
         self.genesis = genesis;
+        self
+    }
+
+    /// Skip the N-1 block fetch used to seed [`BasicRpcDb`] with the parent state root.
+    ///
+    /// Safe when the caller never invokes [`EvmSketch::finalize`], which is the only
+    /// path that reads `BasicRpcDb::state_root`. Saves one `eth_getBlockByNumber`
+    /// round-trip (~30–50 ms per build).
+    pub fn without_state_root_seed(mut self) -> Self {
+        self.seed_state_root = false;
         self
     }
 }
@@ -52,6 +70,7 @@ impl<PT> EvmSketchBuilder<(), PT, ()> {
             genesis: self.genesis,
             provider: provider.clone(),
             anchor_builder: HeaderAnchorBuilder::new(provider),
+            seed_state_root: self.seed_state_root,
             phantom: PhantomData,
         }
     }
@@ -67,6 +86,7 @@ impl<PT> EvmSketchBuilder<(), PT, ()> {
             genesis: self.genesis,
             provider: provider.clone(),
             anchor_builder: HeaderAnchorBuilder::new(provider),
+            seed_state_root: self.seed_state_root,
             phantom: PhantomData,
         }
     }
@@ -87,6 +107,7 @@ impl<P, A> EvmSketchBuilder<P, EthPrimitives, A> {
             genesis: self.genesis,
             provider: self.provider,
             anchor_builder: self.anchor_builder,
+            seed_state_root: self.seed_state_root,
             phantom: PhantomData,
         }
     }
@@ -100,6 +121,7 @@ impl<P, A> EvmSketchBuilder<P, EthPrimitives, A> {
             genesis: Genesis::OpMainnet,
             provider: self.provider,
             anchor_builder: self.anchor_builder,
+            seed_state_root: self.seed_state_root,
             phantom: PhantomData,
         }
     }
@@ -119,6 +141,7 @@ where
             genesis: self.genesis,
             provider: self.provider,
             anchor_builder: BeaconAnchorBuilder::new(self.anchor_builder, rpc_url),
+            seed_state_root: self.seed_state_root,
             phantom: self.phantom,
         }
     }
@@ -138,6 +161,7 @@ where
             genesis: self.genesis,
             provider: self.provider,
             anchor_builder: ChainedBeaconAnchorBuilder::new(self.anchor_builder, block_id.into()),
+            seed_state_root: self.seed_state_root,
             phantom: self.phantom,
         }
     }
@@ -157,6 +181,7 @@ where
             genesis: self.genesis,
             provider: self.provider,
             anchor_builder: self.anchor_builder.into_consensus(),
+            seed_state_root: self.seed_state_root,
             phantom: self.phantom,
         }
     }
@@ -170,23 +195,50 @@ where
 {
     /// Builds an [`EvmSketch`].
     pub async fn build(self) -> Result<EvmSketch<P, PT>, HostError> {
-        let anchor = self.anchor_builder.build(self.block).await?;
+        let anchor;
+        let state_root;
+
+        if self.seed_state_root {
+            if let BlockId::Number(BlockNumberOrTag::Number(n)) = self.block {
+                // Block number is known upfront — fetch anchor and N-1 block concurrently.
+                let prev_n = n
+                    .checked_sub(1)
+                    .ok_or(HostError::BlockNotFoundError(BlockId::number(0)))?;
+                let prev_block_id = BlockId::number(prev_n);
+                let (a, prev_block) = tokio::try_join!(
+                    self.anchor_builder.build(self.block),
+                    async { self.provider.get_block(prev_block_id).await.map_err(Into::into) }
+                )?;
+                anchor = a;
+                state_root = prev_block
+                    .ok_or_else(|| HostError::BlockNotFoundError(prev_block_id))?
+                    .header
+                    .state_root;
+            } else {
+                anchor = self.anchor_builder.build(self.block).await?;
+                let block_number = anchor.header().number;
+                let prev_n = block_number
+                    .checked_sub(1)
+                    .ok_or(HostError::BlockNotFoundError(BlockId::number(0)))?;
+                let prev_block_id = BlockId::number(prev_n);
+                let prev_block = self
+                    .provider
+                    .get_block(prev_block_id)
+                    .await?
+                    .ok_or_else(|| HostError::BlockNotFoundError(prev_block_id))?;
+                state_root = prev_block.header.state_root;
+            }
+        } else {
+            anchor = self.anchor_builder.build(self.block).await?;
+            state_root = B256::ZERO;
+        };
+
         let block_number = anchor.header().number;
-        let previous_block_id = BlockId::number(block_number - 1);
-        let previous_block = self
-            .provider
-            .get_block(previous_block_id)
-            .await?
-            .ok_or_else(|| HostError::BlockNotFoundError(previous_block_id))?;
 
         let sketch = EvmSketch {
             genesis: self.genesis,
             anchor,
-            rpc_db: BasicRpcDb::new(
-                self.provider.clone(),
-                block_number,
-                previous_block.header.state_root,
-            ),
+            rpc_db: BasicRpcDb::new(self.provider.clone(), block_number, state_root),
             receipts: None,
             provider: self.provider,
             phantom: PhantomData,
@@ -203,6 +255,7 @@ impl Default for EvmSketchBuilder<(), EthPrimitives, ()> {
             genesis: Genesis::Mainnet,
             provider: (),
             anchor_builder: (),
+            seed_state_root: true,
             phantom: PhantomData,
         }
     }
