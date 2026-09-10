@@ -51,6 +51,8 @@ pub use anchor::{
 pub mod io;
 
 pub mod inspector;
+
+pub mod prestate;
 pub use inspector::{
     CallTrace, CallTraceArena, CallTraceNode, CallTraceStep, TracingInspector,
     TracingInspectorConfig,

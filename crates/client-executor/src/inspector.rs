@@ -6,5 +6,5 @@
 // Re-export the tracing types from revm-inspectors
 pub use revm_inspectors::tracing::{
     types::{CallTrace, CallTraceNode, CallTraceStep},
-    CallTraceArena, TracingInspector, TracingInspectorConfig,
+    CallTraceArena, GethTraceBuilder, TracingInspector, TracingInspectorConfig,
 };
