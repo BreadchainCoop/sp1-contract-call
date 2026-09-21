@@ -98,11 +98,8 @@ async fn main() -> eyre::Result<()> {
             sketch.call_with_trace(CONTRACT, Address::default(), slot0_call).await?;
 
         // Collect all opcode steps from all call nodes
-        let all_steps: Vec<_> = trace
-            .nodes()
-            .iter()
-            .flat_map(|node| node.trace.steps.iter())
-            .collect();
+        let all_steps: Vec<_> =
+            trace.nodes().iter().flat_map(|node| node.trace.steps.iter()).collect();
 
         println!("\n=== Execution Trace ===");
         println!("Total opcodes executed: {}", all_steps.len());

@@ -336,7 +336,7 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
 mod tests {
     use super::*;
     use crate::ContractCalldata;
-    use alloy_primitives::{address, hex, keccak256, Bytes, U256 as PrimU256};
+    use alloy_primitives::{address, hex, keccak256, Bytes, B256 as PrimB256, U256 as PrimU256};
     use revm::{
         context::result::{ExecutionResult, HaltReason},
         database::{CacheDB, EmptyDB},
@@ -442,6 +442,7 @@ mod tests {
         let output = burner_call_result(crate::EnvOverrides {
             block_gas_limit: None,
             tx_gas_limit: Some(1 << 40),
+            env_commitment: None,
         });
         match output.result {
             ExecutionResult::Success { gas_used, .. } => {
@@ -458,7 +459,11 @@ mod tests {
     /// the block limit implicitly raised to carry a larger transaction limit.
     #[test]
     fn tx_only_override_binds_the_raised_block_limit() {
-        let overrides = crate::EnvOverrides { block_gas_limit: None, tx_gas_limit: Some(1 << 40) };
+        let overrides = crate::EnvOverrides {
+            block_gas_limit: None,
+            tx_gas_limit: Some(1 << 40),
+            env_commitment: None,
+        };
         let limits = overrides.resolve(30_000_000);
 
         assert_eq!(limits.tx, 1 << 40);
@@ -519,6 +524,40 @@ mod tests {
             header_gas_limit,
         )
         .is_err());
+        // An environment commitment is a third, distinct hash: the same limits
+        // under another commitment (or none) do not verify, and a commitment
+        // alone — no gas override — is already bound.
+        let v3 = PrimB256::repeat_byte(0x33);
+        let committed = crate::EnvOverrides::gas_limits(1 << 40).with_env_commitment(v3);
+        let committed_hash = {
+            let config = crate::ChainConfigWithEnvCommitment {
+                chainId: PrimU256::from(chain_id),
+                activeForkName: SpecId::CANCUN.to_string(),
+                blockGasLimitOverride: 1 << 40,
+                txGasLimitOverride: 1 << 40,
+                envCommitment: v3,
+            };
+            keccak256(alloy_sol_types::SolValue::abi_encode_packed(&config))
+        };
+        assert_ne!(committed_hash, overridden);
+        let verify = |hash, overrides| {
+            verify_chain_config_eth_with_overrides(
+                hash,
+                chain_id,
+                SpecId::CANCUN,
+                overrides,
+                header_gas_limit,
+            )
+        };
+        verify(committed_hash, committed).unwrap();
+        assert!(verify(overridden, committed).is_err());
+        assert!(verify(committed_hash, crate::EnvOverrides::gas_limits(1 << 40)).is_err());
+        let other = crate::EnvOverrides::gas_limits(1 << 40)
+            .with_env_commitment(PrimB256::repeat_byte(0x34));
+        assert!(verify(committed_hash, other).is_err());
+        let commitment_only = crate::EnvOverrides::default().with_env_commitment(v3);
+        assert!(verify(legacy, commitment_only).is_err());
+
         // No-override verification degenerates to the legacy path.
         verify_chain_config_eth_with_overrides(
             legacy,

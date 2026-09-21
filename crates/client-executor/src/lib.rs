@@ -156,6 +156,16 @@ pub struct EnvOverrides {
     /// EIP-7825 per-transaction cap (2^24, Osaka onwards) to the same value,
     /// so an override behaves identically across the hardfork boundary.
     pub tx_gas_limit: Option<u64>,
+    /// An opaque 32-byte commitment to everything ELSE the consumer pins in
+    /// its simulation environment — e.g. Gas Killer's `gaskiller.env.unbounded.v3`
+    /// commitment, whose preimage ends `gkvm_spec_version (u32 BE) ||
+    /// cycles_per_gas (u64 BE)` after the gas limits and the overlay segment.
+    /// It changes nothing about execution here; it is folded into
+    /// `chainConfigHash` (see [`ChainConfigWithEnvCommitment`]) so a proof made
+    /// under one environment version cannot satisfy a verifier expecting another.
+    /// The preimage layout is the consumer's; this crate only carries the hash.
+    #[serde(default)]
+    pub env_commitment: Option<B256>,
 }
 
 /// The gas limits an execution actually runs under, derived from
@@ -176,12 +186,24 @@ pub struct ResolvedGasLimits {
 impl EnvOverrides {
     /// Overrides with both gas limits set to `gas_limit`.
     pub fn gas_limits(gas_limit: u64) -> Self {
-        Self { block_gas_limit: Some(gas_limit), tx_gas_limit: Some(gas_limit) }
+        Self {
+            block_gas_limit: Some(gas_limit),
+            tx_gas_limit: Some(gas_limit),
+            env_commitment: None,
+        }
+    }
+
+    /// The same overrides, additionally bound to `commitment`.
+    pub fn with_env_commitment(mut self, commitment: B256) -> Self {
+        self.env_commitment = Some(commitment);
+        self
     }
 
     /// `true` when no override is set, so execution follows the header.
     pub fn is_unset(&self) -> bool {
-        self.block_gas_limit.is_none() && self.tx_gas_limit.is_none()
+        self.block_gas_limit.is_none()
+            && self.tx_gas_limit.is_none()
+            && self.env_commitment.is_none()
     }
 
     /// Resolves the overrides against the anchored header's gas limit.
@@ -208,8 +230,11 @@ impl EnvOverrides {
     /// `None` selects the plain [`ChainConfig`] hash, so this is the single
     /// place that decides whether an execution's `chainConfigHash` carries
     /// gas limits at all.
-    fn resolved_overrides(&self, header_gas_limit: u64) -> Option<ResolvedGasLimits> {
-        (!self.is_unset()).then(|| self.resolve(header_gas_limit))
+    fn resolved_overrides(
+        &self,
+        header_gas_limit: u64,
+    ) -> Option<(ResolvedGasLimits, Option<B256>)> {
+        (!self.is_unset()).then(|| (self.resolve(header_gas_limit), self.env_commitment))
     }
 }
 
@@ -293,6 +318,19 @@ sol! {
         uint64 blockGasLimitOverride;
         uint64 txGasLimitOverride;
     }
+
+    /// [`ChainConfigWithEnvOverrides`] plus the consumer's environment
+    /// commitment ([`EnvOverrides::env_commitment`]). A distinct struct rather
+    /// than a zero-filled field, so hashes of executions that carry no
+    /// commitment are bit-identical to the ones produced before it existed.
+    #[derive(Debug)]
+    struct ChainConfigWithEnvCommitment {
+        uint chainId;
+        string activeForkName;
+        uint64 blockGasLimitOverride;
+        uint64 txGasLimitOverride;
+        bytes32 envCommitment;
+    }
 }
 
 /// The `chainConfigHash` for an execution that ran under `limits`.
@@ -307,16 +345,24 @@ sol! {
 fn compute_chain_config_hash(
     chain_id: u64,
     active_fork_name: String,
-    limits: Option<ResolvedGasLimits>,
+    limits: Option<(ResolvedGasLimits, Option<B256>)>,
 ) -> B256 {
     let encoded = match limits {
         None => ChainConfig { chainId: U256::from(chain_id), activeForkName: active_fork_name }
             .abi_encode_packed(),
-        Some(limits) => ChainConfigWithEnvOverrides {
+        Some((limits, None)) => ChainConfigWithEnvOverrides {
             chainId: U256::from(chain_id),
             activeForkName: active_fork_name,
             blockGasLimitOverride: limits.block,
             txGasLimitOverride: limits.tx,
+        }
+        .abi_encode_packed(),
+        Some((limits, Some(commitment))) => ChainConfigWithEnvCommitment {
+            chainId: U256::from(chain_id),
+            activeForkName: active_fork_name,
+            blockGasLimitOverride: limits.block,
+            txGasLimitOverride: limits.tx,
+            envCommitment: commitment,
         }
         .abi_encode_packed(),
     };

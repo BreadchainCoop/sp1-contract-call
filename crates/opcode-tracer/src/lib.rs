@@ -137,11 +137,7 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
     };
 
     // Build the sketch
-    let sketch = EvmSketch::builder()
-        .at_block(block)
-        .el_rpc_url(rpc_url)
-        .build()
-        .await?;
+    let sketch = EvmSketch::builder().at_block(block).el_rpc_url(rpc_url).build().await?;
 
     // Create the contract input
     let input = ContractInput {
@@ -190,18 +186,11 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
             let name = step.op.as_str().to_string();
 
             // Extract stack (reversed so index 0 is top of stack)
-            let stack = step
-                .stack
-                .as_ref()
-                .map(|s| s.iter().rev().copied().collect())
-                .unwrap_or_default();
+            let stack =
+                step.stack.as_ref().map(|s| s.iter().rev().copied().collect()).unwrap_or_default();
 
             // Extract memory
-            let memory = step
-                .memory
-                .as_ref()
-                .map(|m| m.as_bytes().to_vec())
-                .unwrap_or_default();
+            let memory = step.memory.as_ref().map(|m| m.as_bytes().to_vec()).unwrap_or_default();
 
             // Extract storage change for SSTORE
             let storage_change = step.storage_change.as_ref().map(|sc| StorageChange {
@@ -225,12 +214,7 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
         }
     }
 
-    Ok(TraceResult {
-        opcodes,
-        call_frames,
-        total_gas_used,
-        output: output_bytes,
-    })
+    Ok(TraceResult { opcodes, call_frames, total_gas_used, output: output_bytes })
 }
 
 /// Convenience function to trace a function call using a selector and args.
