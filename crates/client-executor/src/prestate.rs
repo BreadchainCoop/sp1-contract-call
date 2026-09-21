@@ -65,10 +65,8 @@ pub fn storage_diff_from_state(state: &EvmState) -> DiffMode {
             continue;
         }
 
-        diff.pre
-            .insert(*address, AccountState { storage: pre, ..Default::default() });
-        diff.post
-            .insert(*address, AccountState { storage: post, ..Default::default() });
+        diff.pre.insert(*address, AccountState { storage: pre, ..Default::default() });
+        diff.post.insert(*address, AccountState { storage: post, ..Default::default() });
     }
 
     diff
@@ -79,10 +77,8 @@ pub fn storage_diff_from_state(state: &EvmState) -> DiffMode {
 /// Logs are included and sub-calls are kept: a consumer walking the frame tree to
 /// classify a call, or reading events out of it, needs both.
 pub fn call_frame_from_arena(arena: &CallTraceArena, gas_used: u64) -> CallFrame {
-    GethTraceBuilder::new_borrowed(arena.nodes()).geth_call_traces(
-        CallConfig { only_top_call: Some(false), with_log: Some(true) },
-        gas_used,
-    )
+    GethTraceBuilder::new_borrowed(arena.nodes())
+        .geth_call_traces(CallConfig { only_top_call: Some(false), with_log: Some(true) }, gas_used)
 }
 
 #[cfg(test)]
@@ -175,10 +171,7 @@ mod tests {
         let diff = storage_diff_from_state(&state);
 
         // Unchanged under normal rules, but the wipe changes both.
-        assert_eq!(
-            diff.pre[&A].storage,
-            BTreeMap::from([(key(1), value(7)), (key(2), value(4))])
-        );
+        assert_eq!(diff.pre[&A].storage, BTreeMap::from([(key(1), value(7)), (key(2), value(4))]));
         assert_eq!(
             diff.post[&A].storage,
             BTreeMap::from([(key(1), B256::ZERO), (key(2), B256::ZERO)])

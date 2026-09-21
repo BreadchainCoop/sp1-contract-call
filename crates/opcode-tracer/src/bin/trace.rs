@@ -20,14 +20,15 @@ async fn main() -> Result<()> {
         .or_else(|| env::var("ETH_RPC_URL").ok())
         .ok_or_else(|| eyre::eyre!("--rpc-url or ETH_RPC_URL environment variable required"))?;
 
-    let contract_str = get_arg(&args, "--contract")
-        .ok_or_else(|| eyre::eyre!("--contract required"))?;
+    let contract_str =
+        get_arg(&args, "--contract").ok_or_else(|| eyre::eyre!("--contract required"))?;
     let contract: Address = contract_str
         .parse()
         .wrap_err_with(|| format!("invalid contract address: {contract_str}"))?;
 
-    let selector_str = get_arg(&args, "--selector")
-        .ok_or_else(|| eyre::eyre!("--selector required (4-byte function selector, e.g., 0x3850c7bd)"))?;
+    let selector_str = get_arg(&args, "--selector").ok_or_else(|| {
+        eyre::eyre!("--selector required (4-byte function selector, e.g., 0x3850c7bd)")
+    })?;
     let selector = hex::decode(selector_str.trim_start_matches("0x"))
         .wrap_err_with(|| format!("invalid selector hex: {selector_str}"))?;
 
@@ -40,13 +41,7 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    let config = TraceConfig {
-        rpc_url,
-        contract,
-        calldata: selector,
-        block_number,
-        caller: None,
-    };
+    let config = TraceConfig { rpc_url, contract, calldata: selector, block_number, caller: None };
 
     println!("Tracing contract call...");
     println!("  Contract: {}", config.contract);
@@ -80,14 +75,13 @@ async fn main() -> Result<()> {
 
     // Print the raw opcode array
     println!("\nRaw opcode values (hex):");
-    let hex_opcodes: Vec<String> = result.opcode_values().iter().map(|b| format!("{:02x}", b)).collect();
+    let hex_opcodes: Vec<String> =
+        result.opcode_values().iter().map(|b| format!("{:02x}", b)).collect();
     println!("  [{}]", hex_opcodes.join(", "));
 
     Ok(())
 }
 
 fn get_arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1).cloned())
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
 }
