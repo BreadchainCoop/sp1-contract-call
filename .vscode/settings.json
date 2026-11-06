@@ -1,23 +1,26 @@
 {
-  "search.exclude": {
-    "**/.sst": true
-  },
-  "task.allowAutomaticTasks": true,
-  "typescript.tsserver.experimental.enableProjectDiagnostics": true,
-  "editor.defaultFormatter": "esbenp.prettier-vscode",
-  "typescript.preferences.importModuleSpecifier": "relative",
-  "typescript.tsdk": "node_modules/typescript/lib",
-  "debug.openDebug": "neverOpen",
-  "problems.autoReveal": true,
-  "terminal.integrated.hideOnStartup": "always",
-  "terminal.integrated.defaultProfile.windows": "Command Prompt",
-  "terminal.integrated.inheritEnv": false,
-  "jestrunner.configPath": "jest.unit.config.cjs",
-  "compile-hero.disable-compile-files-on-did-save-code": true,
-  "tasks": {
-    "label": "lint on open",
-    "type": "shell",
-    "command": "npm run lint",
-    "runOn": "folderOpen"
-  }
+    "editor.inlineSuggest.enabled": true,
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true,
+        "editor.hover.enabled": true
+    },
+    "editor.rulers": [
+        100
+    ],
+    "rust-analyzer.check.overrideCommand": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--message-format=json",
+        "--all-features",
+        "--all-targets",
+        "--",
+        "-A",
+        "incomplete-features"
+    ],
+    "rust-analyzer.linkedProjects": [
+        "Cargo.toml",
+    ],
+    "rust-analyzer.showUnlinkedFileNotification": false,
 }
