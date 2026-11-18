@@ -514,9 +514,9 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     ///
     /// Storage accesses are already validated against the `witness_db`'s state root.
     ///
-    /// Note: It's the caller's responsability to commit the pubic values returned by
+    /// Note: It's the caller's responsibility to commit the public values returned by
     /// this function. [`execute_and_commit`] can be used instead of this function
-    /// to automatically commit if the execution is successful.
+    /// to commit automatically, at the cost of panicking if the call fails.
     ///
     /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
     pub fn execute(&self, call: ContractInput) -> eyre::Result<ContractPublicValues> {
@@ -569,8 +569,19 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     /// and commit the result to the public values stream.
     ///
     /// Storage accesses are already validated against the `witness_db`'s state root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the call fails (a transaction error, revert or halt), with the error in
+    /// the panic message. This is deliberate: in a guest, a call that cannot be proven
+    /// should produce no proof, and a panic does exactly that. Committing nothing and
+    /// returning would instead let the guest finish with empty public values. To handle
+    /// the failure yourself, call [`execute`] and commit its result with
+    /// `sp1_zkvm::io::commit_slice`.
+    ///
+    /// [`execute`]: ClientExecutor::execute
     pub fn execute_and_commit(&self, call: ContractInput) {
-        let public_values = self.execute(call).unwrap();
+        let public_values = self.execute(call).expect("execute_and_commit: call failed");
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
@@ -580,9 +591,9 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     /// The opcode hash is computed as `keccak256(opcode_bytes)` where `opcode_bytes` is the
     /// concatenation of all opcode bytes executed in order across all call frames.
     ///
-    /// Note: It's the caller's responsability to commit the public values returned by
+    /// Note: It's the caller's responsibility to commit the public values returned by
     /// this function. [`execute_with_trace_and_commit`] can be used instead of this function
-    /// to automatically commit if the execution is successful.
+    /// to commit automatically, at the cost of panicking if the call fails.
     ///
     /// [`execute_with_trace_and_commit`]: ClientExecutor::execute_with_trace_and_commit
     pub fn execute_with_trace(
@@ -641,17 +652,32 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     ///
     /// This is the tracing equivalent of [`execute_and_commit`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the call fails, for the reasons given on [`execute_and_commit`]. To
+    /// handle the failure yourself, call [`execute_with_trace`] and commit its result.
+    ///
     /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
+    /// [`execute_with_trace`]: ClientExecutor::execute_with_trace
     pub fn execute_with_trace_and_commit(&self, call: ContractInput) {
-        let public_values = self.execute_with_trace(call).unwrap();
+        let public_values =
+            self.execute_with_trace(call).expect("execute_with_trace_and_commit: call failed");
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
     /// [`execute_and_commit`] under explicit [`EnvOverrides`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the call fails, for the reasons given on [`execute_and_commit`]. To
+    /// handle the failure yourself, call [`execute_with_overrides`] and commit its result.
+    ///
     /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
+    /// [`execute_with_overrides`]: ClientExecutor::execute_with_overrides
     pub fn execute_and_commit_with_overrides(&self, call: ContractInput, overrides: EnvOverrides) {
-        let public_values = self.execute_with_overrides(call, overrides).unwrap();
+        let public_values = self
+            .execute_with_overrides(call, overrides)
+            .expect("execute_and_commit_with_overrides: call failed");
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
