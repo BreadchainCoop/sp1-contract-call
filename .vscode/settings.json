@@ -23,12 +23,4 @@
         "Cargo.toml",
     ],
     "rust-analyzer.showUnlinkedFileNotification": false,
-    "rust-analyzer.rustfmt.overrideCommand": [
-        "rustup",
-        "run",
-        "nightly-2026-11-18",
-        "rustfmt",
-        "--edition",
-        "2021"
-    ],
 }
