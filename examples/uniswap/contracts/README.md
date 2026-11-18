@@ -2,7 +2,7 @@
 
 This contract demonstrates how to deserialize a proof, public values, and vkey from a json file, and use them for on chain verification. 
 
-Make sure you have [foundry](https://github.com/foundry-rs/foundry) installed.
+Make sure you have [foundry](https://github.com/foundry-rs/foundry) installed, then fetch the Solidity dependencies from the repository root with `./contracts/install-deps.sh`. They are not git submodules, so cloning the repository does not fetch them.
 
 First, run the uniswap example with `cargo run --release --bin uniswap`. This serializes a proof, public values, and a vkey to [`plonk-fixture.json`](./src/fixtures/plonk-fixture.json).  
 
