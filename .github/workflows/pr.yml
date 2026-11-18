@@ -96,8 +96,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Install Solidity dependencies
+        run: ./contracts/install-deps.sh
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1

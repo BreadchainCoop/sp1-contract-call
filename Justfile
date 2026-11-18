@@ -1,6 +1,8 @@
 deploy-uniswap-example-contract rpc_url private_key:
   #!/usr/bin/env bash
+  set -euo pipefail
 
+  ./contracts/install-deps.sh
   cd examples/uniswap/contracts
   forge create src/UniswapCall.sol:UniswapCall \
     --rpc-url {{rpc_url}} \

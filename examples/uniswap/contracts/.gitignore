@@ -12,3 +12,6 @@ docs/
 
 # Dotenv file
 .env
+
+# Dependencies, fetched by contracts/install-deps.sh
+lib/
