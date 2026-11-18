@@ -134,12 +134,11 @@ impl ContractInput {
 /// # Determinism is protocol-critical
 ///
 /// The same overrides MUST be used bit-identically by:
-/// 1. the **host** (`EvmSketch::call*_with_overrides`) — otherwise the sketch
-///    stops prefetching state at the point the host execution halted, and the
-///    guest panics on a missing witness;
-/// 2. the **guest** (`ClientExecutor::execute_with_overrides`) — otherwise a
-///    heavy-but-honest execution runs out of gas in the proof and re-derives a
-///    different result, falsely incriminating an honest operator;
+/// 1. the **host** (`EvmSketch::call*_with_overrides`) — otherwise the sketch stops prefetching
+///    state at the point the host execution halted, and the guest panics on a missing witness;
+/// 2. the **guest** (`ClientExecutor::execute_with_overrides`) — otherwise a heavy-but-honest
+///    execution runs out of gas in the proof and re-derives a different result, falsely
+///    incriminating an honest operator;
 /// 3. every other party re-deriving the execution.
 ///
 /// This crate provides the mechanism only; canonical override values are
