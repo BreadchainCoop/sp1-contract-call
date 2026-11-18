@@ -32,14 +32,13 @@ use crate::inspector::CallTraceArena;
 ///
 /// Two limitations worth knowing before relying on this for a consensus decision:
 ///
-/// * A self-destructed account's storage is reported as going to zero, but only for
-///   the slots the execution actually loaded. Slots never touched are absent from
-///   the journal, so a diff built from it cannot report them. Reading the full
-///   pre-state would require the database, which this function does not take.
-/// * Log ordering inside [`call_frame_from_arena`] is this builder's, and Geth
-///   populates `position` where other clients populate `index`. A consumer that
-///   compares against a node's `callTracer` output byte-for-byte has to confirm the
-///   two agree on ordering rather than assume it.
+/// * A self-destructed account's storage is reported as going to zero, but only for the slots the
+///   execution actually loaded. Slots never touched are absent from the journal, so a diff built
+///   from it cannot report them. Reading the full pre-state would require the database, which this
+///   function does not take.
+/// * Log ordering inside [`call_frame_from_arena`] is this builder's, and Geth populates `position`
+///   where other clients populate `index`. A consumer that compares against a node's `callTracer`
+///   output byte-for-byte has to confirm the two agree on ordering rather than assume it.
 pub fn storage_diff_from_state(state: &EvmState) -> DiffMode {
     let mut diff = DiffMode::default();
 

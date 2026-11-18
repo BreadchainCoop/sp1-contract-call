@@ -134,12 +134,11 @@ impl ContractInput {
 /// # Determinism is protocol-critical
 ///
 /// The same overrides MUST be used bit-identically by:
-/// 1. the **host** (`EvmSketch::call*_with_overrides`) — otherwise the sketch
-///    stops prefetching state at the point the host execution halted, and the
-///    guest panics on a missing witness;
-/// 2. the **guest** (`ClientExecutor::execute_with_overrides`) — otherwise a
-///    heavy-but-honest execution runs out of gas in the proof and re-derives a
-///    different result, falsely incriminating an honest operator;
+/// 1. the **host** (`EvmSketch::call*_with_overrides`) — otherwise the sketch stops prefetching
+///    state at the point the host execution halted, and the guest panics on a missing witness;
+/// 2. the **guest** (`ClientExecutor::execute_with_overrides`) — otherwise a heavy-but-honest
+///    execution runs out of gas in the proof and re-derives a different result, falsely
+///    incriminating an honest operator;
 /// 3. every other party re-deriving the execution.
 ///
 /// This crate provides the mechanism only; canonical override values are
@@ -201,9 +200,9 @@ impl EnvOverrides {
 
     /// `true` when no override is set, so execution follows the header.
     pub fn is_unset(&self) -> bool {
-        self.block_gas_limit.is_none()
-            && self.tx_gas_limit.is_none()
-            && self.env_commitment.is_none()
+        self.block_gas_limit.is_none() &&
+            self.tx_gas_limit.is_none() &&
+            self.env_commitment.is_none()
     }
 
     /// Resolves the overrides against the anchored header's gas limit.
@@ -788,13 +787,13 @@ mod state_opcodes {
 pub fn is_state_modifying_opcode(opcode: u8) -> bool {
     matches!(
         opcode,
-        state_opcodes::SSTORE
-            | state_opcodes::CALL
-            | state_opcodes::LOG0
-            | state_opcodes::LOG1
-            | state_opcodes::LOG2
-            | state_opcodes::LOG3
-            | state_opcodes::LOG4
+        state_opcodes::SSTORE |
+            state_opcodes::CALL |
+            state_opcodes::LOG0 |
+            state_opcodes::LOG1 |
+            state_opcodes::LOG2 |
+            state_opcodes::LOG3 |
+            state_opcodes::LOG4
     )
 }
 
