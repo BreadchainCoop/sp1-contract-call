@@ -545,7 +545,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.chain_spec.clone(),
             overrides,
         )
-        .unwrap();
+        .map_err(|e| eyre::eyre!("Transaction failed: {e}"))?;
 
         let tx_output_bytes = match tx_output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),
@@ -613,7 +613,7 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.chain_spec.clone(),
             overrides,
         )
-        .unwrap();
+        .map_err(|e| eyre::eyre!("Transaction failed: {e}"))?;
 
         let tx_output_bytes = match tx_output.result {
             ExecutionResult::Success { output, .. } => output.data().clone(),
