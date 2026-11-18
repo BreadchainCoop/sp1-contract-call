@@ -14,6 +14,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      # rustfmt.toml uses nightly-only options, which stable rustfmt ignores,
+      # so formatting is checked with nightly. Pinned to a dated nightly so a
+      # rustfmt release cannot fail CI without a code change; bump it together
+      # with the README and .vscode/settings.json, and reformat in that commit.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-18
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo +nightly-2026-11-18 fmt --all --check
+
   test:
     name: clippy and test
     runs-on: ubuntu-latest
