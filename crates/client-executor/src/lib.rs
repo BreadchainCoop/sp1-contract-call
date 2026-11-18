@@ -30,7 +30,7 @@ use alloy_primitives::{keccak256, Log};
 use alloy_rpc_types::{Filter, FilteredParams};
 use alloy_sol_types::{sol, SolCall, SolEvent, SolValue};
 use alloy_trie::root::ordered_trie_root_with_encoder;
-use eyre::bail;
+use eyre::{bail, WrapErr};
 use io::EvmSketchInput;
 use reth_chainspec::EthChainSpec;
 use reth_primitives::EthPrimitives;
@@ -59,7 +59,7 @@ pub use inspector::{
 };
 
 mod errors;
-pub use errors::ClientError;
+pub use errors::{ClientError, TransactError};
 
 pub use rsp_primitives::genesis::Genesis;
 
@@ -423,6 +423,19 @@ impl ContractPublicValuesWithTrace {
     }
 }
 
+/// The return data of a successful execution.
+///
+/// Returns an error naming the revert data or halt reason when the execution
+/// did not succeed. Shared by the guest executor and the host sketch so both
+/// report failures identically.
+pub fn execution_output<H: std::fmt::Debug>(result: ExecutionResult<H>) -> eyre::Result<Bytes> {
+    match result {
+        ExecutionResult::Success { output, .. } => Ok(output.data().clone()),
+        ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
+        ExecutionResult::Halt { reason, .. } => bail!("Execution halted: {reason:?}"),
+    }
+}
+
 /// An executor that executes smart contract calls inside a zkVM.
 #[derive(Debug)]
 pub struct ClientExecutor<'a, P: Primitives> {
@@ -518,6 +531,20 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     /// this function. [`execute_and_commit`] can be used instead of this function
     /// to commit automatically, at the cost of panicking if the call fails.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the call reverts, halts, or is rejected by revm before it
+    /// runs. A rejection carries a [`TransactError`], which can be recovered with
+    /// `report.downcast_ref::<TransactError>()`; [`TransactError::InvalidTransaction`]
+    /// means the call is invalid under the execution environment, e.g. its gas limit is
+    /// below the intrinsic cost.
+    ///
+    /// An error is a value the guest can act on, not an abort. A guest that commits a
+    /// fallback on `Err` produces a valid proof for that fallback, and the prover chooses
+    /// the call and overrides, so it can force the error branch on purpose. Only treat an
+    /// error as a soft failure if a proof of that failure is acceptable to the verifier;
+    /// otherwise use [`execute_and_commit`], which panics and so produces no proof.
+    ///
     /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
     pub fn execute(&self, call: ContractInput) -> eyre::Result<ContractPublicValues> {
         self.execute_with_overrides(call, EnvOverrides::default())
@@ -545,13 +572,9 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.chain_spec.clone(),
             overrides,
         )
-        .map_err(|e| eyre::eyre!("Transaction failed: {e}"))?;
+        .wrap_err("Transaction failed")?;
 
-        let tx_output_bytes = match tx_output.result {
-            ExecutionResult::Success { output, .. } => output.data().clone(),
-            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
-            ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
-        };
+        let tx_output_bytes = execution_output(tx_output.result)?;
 
         let public_values = ContractPublicValues::new(
             call,
@@ -577,11 +600,13 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     /// should produce no proof, and a panic does exactly that. Committing nothing and
     /// returning would instead let the guest finish with empty public values. To handle
     /// the failure yourself, call [`execute`] and commit its result with
-    /// `sp1_zkvm::io::commit_slice`.
+    /// `sp1_zkvm::io::commit_slice(&public_values.abi_encode())`; see its `# Errors`
+    /// section before treating a failure as anything but fatal.
     ///
     /// [`execute`]: ClientExecutor::execute
     pub fn execute_and_commit(&self, call: ContractInput) {
-        let public_values = self.execute(call).expect("execute_and_commit: call failed");
+        let public_values =
+            self.execute(call).unwrap_or_else(|e| panic!("execute_and_commit: call failed: {e:#}"));
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
@@ -624,13 +649,9 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
             self.chain_spec.clone(),
             overrides,
         )
-        .map_err(|e| eyre::eyre!("Transaction failed: {e}"))?;
+        .wrap_err("Transaction failed")?;
 
-        let tx_output_bytes = match tx_output.result {
-            ExecutionResult::Success { output, .. } => output.data().clone(),
-            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
-            ExecutionResult::Halt { reason, .. } => bail!("Execution halted : {reason:?}"),
-        };
+        let tx_output_bytes = execution_output(tx_output.result)?;
 
         // Compute opcode hash: collect all opcode bytes from all call frames and hash them
         let opcode_hash = compute_opcode_hash(&trace);
@@ -655,13 +676,15 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     /// # Panics
     ///
     /// Panics if the call fails, for the reasons given on [`execute_and_commit`]. To
-    /// handle the failure yourself, call [`execute_with_trace`] and commit its result.
+    /// handle the failure yourself, call [`execute_with_trace`] and commit
+    /// `public_values.abi_encode()` with `sp1_zkvm::io::commit_slice`.
     ///
     /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
     /// [`execute_with_trace`]: ClientExecutor::execute_with_trace
     pub fn execute_with_trace_and_commit(&self, call: ContractInput) {
-        let public_values =
-            self.execute_with_trace(call).expect("execute_with_trace_and_commit: call failed");
+        let public_values = self
+            .execute_with_trace(call)
+            .unwrap_or_else(|e| panic!("execute_with_trace_and_commit: call failed: {e:#}"));
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 
@@ -670,14 +693,15 @@ impl<'a, P: Primitives> ClientExecutor<'a, P> {
     /// # Panics
     ///
     /// Panics if the call fails, for the reasons given on [`execute_and_commit`]. To
-    /// handle the failure yourself, call [`execute_with_overrides`] and commit its result.
+    /// handle the failure yourself, call [`execute_with_overrides`] and commit
+    /// `public_values.abi_encode()` with `sp1_zkvm::io::commit_slice`.
     ///
     /// [`execute_and_commit`]: ClientExecutor::execute_and_commit
     /// [`execute_with_overrides`]: ClientExecutor::execute_with_overrides
     pub fn execute_and_commit_with_overrides(&self, call: ContractInput, overrides: EnvOverrides) {
         let public_values = self
             .execute_with_overrides(call, overrides)
-            .expect("execute_and_commit_with_overrides: call failed");
+            .unwrap_or_else(|e| panic!("execute_and_commit_with_overrides: call failed: {e:#}"));
         sp1_zkvm::io::commit_slice(&public_values.abi_encode());
     }
 

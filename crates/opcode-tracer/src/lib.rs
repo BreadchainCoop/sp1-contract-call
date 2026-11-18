@@ -157,19 +157,10 @@ pub async fn trace_call(config: TraceConfig) -> Result<TraceResult> {
         alloy_primitives::U256::ZERO,
         chain_spec,
         Default::default(),
-    )
-    .map_err(|e: String| eyre::eyre!(e))?;
+    )?;
 
     // Extract output bytes
-    let output_bytes = match output.result {
-        revm::context::result::ExecutionResult::Success { output, .. } => output.data().to_vec(),
-        revm::context::result::ExecutionResult::Revert { output, .. } => {
-            eyre::bail!("Execution reverted: {output}")
-        }
-        revm::context::result::ExecutionResult::Halt { reason, .. } => {
-            eyre::bail!("Execution halted: {reason:?}")
-        }
-    };
+    let output_bytes = sp1_cc_client_executor::execution_output(output.result)?.to_vec();
 
     // Convert trace to our format
     let nodes = trace.nodes();

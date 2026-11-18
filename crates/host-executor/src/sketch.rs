@@ -6,13 +6,14 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{network::AnyNetwork, Provider};
 use alloy_rpc_types::{AnyReceiptEnvelope, Filter, Log as RpcLog};
 use alloy_sol_types::SolCall;
-use eyre::{bail, eyre};
+use eyre::WrapErr;
 use reth_primitives::EthPrimitives;
-use revm::{context::result::ExecutionResult, database::CacheDB};
+use revm::database::CacheDB;
 use rsp_mpt::EthereumState;
 use rsp_primitives::{account_proof::eip1186_proof_to_account_proof, genesis::Genesis};
 use rsp_rpc_db::{BasicRpcDb, RpcDb};
 use sp1_cc_client_executor::{
+    execution_output,
     io::{EvmSketchInput, Primitives},
     Anchor, CallTraceArena, ContractInput, EnvOverrides,
 };
@@ -81,13 +82,9 @@ where
         let input = ContractInput::new_call(contract_address, caller_address, calldata);
         let output =
             PT::transact(&input, cache_db, self.anchor.header(), U256::ZERO, chain_spec, overrides)
-                .map_err(|err| eyre!(err))?;
+                .wrap_err("Transaction failed")?;
 
-        let output_bytes = match output.result {
-            ExecutionResult::Success { output, .. } => output.data().clone(),
-            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
-            ExecutionResult::Halt { reason, .. } => bail!("Execution halted: {reason:?}"),
-        };
+        let output_bytes = execution_output(output.result)?;
 
         Ok(C::abi_decode_returns(&output_bytes)?)
     }
@@ -136,13 +133,9 @@ where
             chain_spec,
             overrides,
         )
-        .map_err(|err| eyre!(err))?;
+        .wrap_err("Transaction failed")?;
 
-        let output_bytes = match output.result {
-            ExecutionResult::Success { output, .. } => output.data().clone(),
-            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
-            ExecutionResult::Halt { reason, .. } => bail!("Execution halted: {reason:?}"),
-        };
+        let output_bytes = execution_output(output.result)?;
 
         Ok((C::abi_decode_returns(&output_bytes)?, trace))
     }
@@ -164,13 +157,9 @@ where
         let chain_spec = PT::build_spec(&self.genesis)?;
         let output =
             PT::transact(input, cache_db, self.anchor.header(), U256::ZERO, chain_spec, overrides)
-                .map_err(|err| eyre!(err))?;
+                .wrap_err("Transaction failed")?;
 
-        let output_bytes = match output.result {
-            ExecutionResult::Success { output, .. } => output.data().clone(),
-            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
-            ExecutionResult::Halt { reason, .. } => bail!("Execution halted: {reason:?}"),
-        };
+        let output_bytes = execution_output(output.result)?;
 
         Ok(output_bytes)
     }
@@ -188,13 +177,9 @@ where
             chain_spec,
             Default::default(),
         )
-        .map_err(|err| eyre!(err))?;
+        .wrap_err("Transaction failed")?;
 
-        let output_bytes = match output.result {
-            ExecutionResult::Success { output, .. } => output.data().clone(),
-            ExecutionResult::Revert { output, .. } => bail!("Execution reverted: {output}"),
-            ExecutionResult::Halt { reason, .. } => bail!("Execution halted: {reason:?}"),
-        };
+        let output_bytes = execution_output(output.result)?;
 
         Ok(output_bytes)
     }
