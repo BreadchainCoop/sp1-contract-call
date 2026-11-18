@@ -36,7 +36,7 @@ use rsp_primitives::genesis::Genesis;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{Anchor, ContractInput, EnvOverrides, ResolvedGasLimits};
+use crate::{Anchor, ContractInput, EnvOverrides, ResolvedGasLimits, TransactError};
 
 /// Information about how the contract executions accessed state, which is needed to execute the
 /// contract in SP1.
@@ -110,7 +110,7 @@ pub trait Primitives: NodePrimitives {
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
         overrides: EnvOverrides,
-    ) -> Result<ResultAndState<Self::HaltReason>, String>
+    ) -> Result<ResultAndState<Self::HaltReason>, TransactError>
     where
         DB: Database;
 
@@ -123,7 +123,7 @@ pub trait Primitives: NodePrimitives {
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
         overrides: EnvOverrides,
-    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String>
+    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), TransactError>
     where
         DB: Database;
 
@@ -182,7 +182,7 @@ impl Primitives for EthPrimitives {
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
         overrides: EnvOverrides,
-    ) -> Result<ResultAndState<Self::HaltReason>, String> {
+    ) -> Result<ResultAndState<Self::HaltReason>, TransactError> {
         let EvmEnv { mut cfg_env, mut block_env, .. } =
             EthEvmConfig::new(chain_spec).evm_env(header).unwrap();
 
@@ -206,7 +206,7 @@ impl Primitives for EthPrimitives {
 
         let mut evm = EthEvm::new(evm, false);
 
-        evm.transact(tx_env).map_err(|err| err.to_string())
+        evm.transact(tx_env).map_err(TransactError::from)
     }
 
     fn transact_with_trace<DB: Database>(
@@ -216,7 +216,7 @@ impl Primitives for EthPrimitives {
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
         overrides: EnvOverrides,
-    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
+    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), TransactError> {
         let EvmEnv { mut cfg_env, mut block_env, .. } =
             EthEvmConfig::new(chain_spec).evm_env(header).unwrap();
 
@@ -242,7 +242,7 @@ impl Primitives for EthPrimitives {
 
         let mut evm = EthEvm::new(evm, true); // true enables inspector
 
-        let result = evm.transact(tx_env).map_err(|err| err.to_string())?;
+        let result = evm.transact(tx_env).map_err(TransactError::from)?;
 
         // Extract the trace from the inspector
         let trace = evm.into_inner().inspector.into_traces();
@@ -281,7 +281,7 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
         overrides: EnvOverrides,
-    ) -> Result<ResultAndState<Self::HaltReason>, String> {
+    ) -> Result<ResultAndState<Self::HaltReason>, TransactError> {
         use op_revm::{DefaultOp, OpBuilder};
 
         let EvmEnv { mut cfg_env, mut block_env, .. } =
@@ -307,7 +307,7 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
 
         let mut evm = alloy_op_evm::OpEvm::new(evm, false);
 
-        evm.transact(tx_env).map_err(|err| err.to_string())
+        evm.transact(tx_env).map_err(TransactError::from)
     }
 
     fn transact_with_trace<DB: Database>(
@@ -317,7 +317,7 @@ impl Primitives for reth_optimism_primitives::OpPrimitives {
         difficulty: U256,
         chain_spec: Arc<Self::ChainSpec>,
         overrides: EnvOverrides,
-    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), String> {
+    ) -> Result<(ResultAndState<Self::HaltReason>, CallTraceArena), TransactError> {
         // For Optimism, we currently don't support tracing due to API limitations.
         // Just run the regular transact and return an empty trace.
         let result = Self::transact(input, db, header, difficulty, chain_spec, overrides)?;
@@ -368,6 +368,12 @@ mod tests {
     fn burner_call_result(
         overrides: crate::EnvOverrides,
     ) -> revm::context::result::ResultAndState<HaltReason> {
+        burner_transact(overrides).expect("transact must not error at the EVM-construction level")
+    }
+
+    fn burner_transact(
+        overrides: crate::EnvOverrides,
+    ) -> Result<revm::context::result::ResultAndState<HaltReason>, TransactError> {
         let burner = address!("0x0000000000000000000000000000000000002001");
         let mut db = CacheDB::new(EmptyDB::default());
         let code = revm::state::Bytecode::new_raw(gigagas_burner_runtime());
@@ -389,7 +395,58 @@ mod tests {
         let chain_spec = EthPrimitives::build_spec(&Genesis::Mainnet).unwrap();
 
         EthPrimitives::transact(&input, db, &test_header(), U256::ZERO, chain_spec, overrides)
-            .expect("transact must not error at the EVM-construction level")
+    }
+
+    /// A transaction revm rejects before running must come back as a typed
+    /// [`TransactError::InvalidTransaction`], not a panic: a gas limit below
+    /// the 21,000 intrinsic cost is invalid whatever the state.
+    #[test]
+    fn invalid_transaction_is_a_typed_error() {
+        let err = burner_transact(crate::EnvOverrides {
+            block_gas_limit: None,
+            tx_gas_limit: Some(1_000),
+            env_commitment: None,
+        })
+        .expect_err("a gas limit below the intrinsic cost must be rejected");
+        assert!(
+            matches!(err, TransactError::InvalidTransaction(_)),
+            "expected an invalid-transaction error, got {err:?}"
+        );
+    }
+
+    /// The executor wraps a [`TransactError`] in an `eyre::Report`; callers
+    /// must still be able to recover the typed error from it.
+    #[test]
+    fn transact_error_survives_eyre_wrapping() {
+        use eyre::WrapErr;
+
+        let report = Err::<(), _>(TransactError::Database("missing node".into()))
+            .wrap_err("Transaction failed")
+            .unwrap_err();
+        assert_eq!(
+            report.downcast_ref::<TransactError>(),
+            Some(&TransactError::Database("missing node".into()))
+        );
+        assert_eq!(format!("{report:#}"), "Transaction failed: database error: missing node");
+    }
+
+    #[test]
+    fn execution_output_maps_each_result() {
+        assert_eq!(
+            crate::execution_output(
+                burner_call_result(crate::EnvOverrides::gas_limits(1 << 40)).result
+            )
+            .unwrap()
+            .as_ref(),
+            PrimU256::from(42).to_be_bytes::<32>()
+        );
+        let halted =
+            crate::execution_output(burner_call_result(crate::EnvOverrides::default()).result)
+                .unwrap_err();
+        assert!(
+            halted.to_string().starts_with("Execution halted: OutOfGas"),
+            "unexpected halt message: {halted}"
+        );
     }
 
     /// Without overrides an execution gets exactly the header's gas limit, so
